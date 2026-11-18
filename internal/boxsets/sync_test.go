@@ -42,6 +42,7 @@ type fakeAPI struct {
 	boxSetReads int
 	deleteErr   error
 	lookupErr   map[string]error
+	readErr     map[string]error
 	sourceErr   error
 	uploads     []string
 	nextID      int
@@ -83,6 +84,9 @@ func (f *fakeAPI) ItemBoxSet(ctx context.Context, cid, lib string) (*silo.BoxSet
 }
 func (f *fakeAPI) BoxSet(_ context.Context, id, _ string) (silo.BoxSet, error) {
 	f.boxSetReads++
+	if err := f.readErr[id]; err != nil {
+		return silo.BoxSet{}, err
+	}
 	return f.boxSet(id)
 }
 
@@ -504,5 +508,27 @@ func TestSyncRefusesMassRemoval(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(r.Errors, "\n"), "removals skipped") {
 		t.Fatalf("report: %v", r.Errors)
+	}
+}
+
+// A collection goes only when Silo says its box set does not form (404).
+// Any other answer about it keeps the collection.
+func TestSyncRemovesOnlyOnSilosWord(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"a1": "10", "a2": "10"}
+	api.collections["c30"] = &silo.Collection{ID: "c30", Title: "Rocky", Slug: "box-set-30"}
+	api.collections["c40"] = &silo.Collection{ID: "c40", Title: "Saw", Slug: "box-set-40"}
+	api.readErr = map[string]error{"30": &silo.Error{Status: 500, Body: "boom"}}
+
+	r, err := s.Sync(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api.collections["c30"] == nil {
+		t.Fatal("removed a collection Silo could not answer for")
+	}
+	if api.collections["c40"] != nil || r.Removed != 1 {
+		t.Fatalf("box set 40 does not form (404) and should go: %+v", r)
 	}
 }

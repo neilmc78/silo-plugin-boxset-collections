@@ -412,6 +412,17 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		remove = nil
 	}
 	for _, c := range remove {
+		// Not finding a box set is not proof it is gone: only Silo saying
+		// so for this box set (404) removes its collection.
+		id := strings.TrimPrefix(c.Slug, collectionSlugPrefix)
+		if b, err := api.BoxSet(ctx, id, lib.ID); !errors.Is(err, silo.ErrNotFound) {
+			if err != nil {
+				report.addError(lib, "kept %q: could not confirm its box set is gone: %v", c.Title, err)
+			} else if len(b.Members) > 0 {
+				report.addError(lib, "kept %q: its box set still forms, though no movie lookup found it", c.Title)
+			}
+			continue
+		}
 		if err := api.DeleteCollection(ctx, c.ID); err != nil {
 			report.addError(lib, "removing %q: %v", c.Title, err)
 			continue

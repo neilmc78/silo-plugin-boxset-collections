@@ -11,7 +11,7 @@ On each run, for every movie library:
 1. Looks up which box set each movie belongs to. One answer covers every movie in that box set, and answers are cached, so routine runs only look up new or refreshed movies.
 2. Creates a collection for each box set that forms. Silo forms a box set once the library has enough of its movies and box sets are turned on for the library.
 3. Keeps each collection's title, description and movies (in collection order) the same as its box set.
-4. Removes a collection once its box set no longer forms. Removals happen only on a run that looked up every movie successfully, and never when a run would remove more than half of a library's box set collections. Those cases are listed in the task's output, and you can delete the collections by hand if the removal was intended.
+4. Removes a collection once its box set no longer forms, and only when Silo confirms it for that box set. Removals also need a run that looked up every movie successfully, and never happen when a run would remove more than half of a library's box set collections. Those cases are listed in the task's output, and you can delete the collections by hand if the removal was intended.
 5. Gives each collection the box set's poster and backdrop, and swaps them when TMDB's artwork changes. If you upload your own image, it is left alone. An image that can't be fetched is tried again on the next run. Silo fetches the image itself when it can. Otherwise the plugin downloads and uploads it, for example when artwork is served from a storage server on your LAN.
 
 A failure on one collection, such as a removal Silo refuses because a Home row still shows the collection, is listed in the task's output and the run moves on to the next collection.
