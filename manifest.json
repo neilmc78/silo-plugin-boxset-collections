@@ -1,0 +1,89 @@
+{
+  "plugin_id": "neilmc78.collections.boxsets",
+  "version": "0.1.0",
+  "checksum": "__CHECKSUM__",
+  "silo_api_version": "v1",
+  "category": "Collections",
+  "presentation": {
+    "display_name": "Box Set Collections",
+    "summary": "Shows every box set as a collection in a Box Sets group, kept in step with your library.",
+    "description_markdown": "Silo already groups franchise movies into box sets, with the collection's poster, backdrop and overview, but shows them only on a movie's page and in search. This plugin gives each box set a matching collection in a **Box Sets** group under the library's Collections, so franchises appear wherever collections do: the Collections tab, collection rows on Home, and Jellyfin apps.\n\n- **No extra TMDB requests.** It reads only the box set data Silo already stores.\n- **Stays in step.** After a library scan or a metadata refresh, and on its schedule, it adds and removes movies, and removes a collection once its box set no longer forms (too few movies, or box sets turned off for the library).\n- **Your changes stay.** Visibility, featuring, placement and any poster or backdrop you upload are left alone. The plugin owns each collection's title, description and movies.",
+    "setup_markdown": "1. Turn on **Box sets** for your movie libraries in the library settings, if they are not on already.\n2. In **Admin → API Keys**, create a key with no scopes for the server Owner account (or another administrator). Silo has no narrower scope for collections. Profile PINs don't matter: API keys skip them.\n3. Paste the key under this plugin's **Settings**.\n4. Open **Admin → Scheduled Tasks**, run **Sync box set collections** once, and give it a daily schedule. After that it also runs by itself shortly after library scans and metadata refreshes.",
+    "homepage_url": "https://github.com/neilmc78/silo-plugin-boxset-collections",
+    "source_url": "https://github.com/neilmc78/silo-plugin-boxset-collections",
+    "support_url": "https://github.com/neilmc78/silo-plugin-boxset-collections/issues",
+    "changelog_url": "https://github.com/neilmc78/silo-plugin-boxset-collections/releases",
+    "publisher_name": "neilmc78",
+    "publisher_url": "https://github.com/neilmc78",
+    "license_spdx": "AGPL-3.0-or-later"
+  },
+  "supported_platforms": [
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "settings",
+      "title": "Settings",
+      "description": "How the plugin reaches Silo's API, and where the box sets go.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\",\"writeOnly\":true},\"group_name\":{\"type\":\"string\"},\"silo_url\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+      "required": true,
+      "admin_form": {
+        "submit_label": "Save settings",
+        "fields": [
+          {
+            "key": "api_key",
+            "label": "API key",
+            "description": "An unscoped Silo API key of the Owner or another administrator account; the plugin creates and updates collections with it. Stored encrypted.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true,
+            "required": true
+          },
+          {
+            "key": "group_name",
+            "label": "Group name",
+            "description": "The collection group box sets go in, created in each movie library that has box sets.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "Box Sets",
+            "placeholder": "Box Sets"
+          },
+          {
+            "key": "silo_url",
+            "label": "Silo URL (optional)",
+            "description": "Only if the plugin cannot reach Silo on the address the server reports for itself, for example http://localhost:8080.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "http://localhost:8080"
+          }
+        ]
+      }
+    }
+  ],
+  "capabilities": [
+    {
+      "type": "scheduled_task.v1",
+      "id": "sync",
+      "display_name": "Sync box set collections",
+      "description": "Brings every movie library's box set collections in line with its box sets, looking every movie up again.",
+      "metadata": {
+        "display_name": "Sync box set collections",
+        "description": "Brings every movie library's box set collections in line with its box sets, looking every movie up again."
+      }
+    },
+    {
+      "type": "event_consumer.v1",
+      "id": "library-changes",
+      "display_name": "Library changes",
+      "description": "Updates box set collections shortly after a library scan or a metadata refresh.",
+      "subscriptions": [
+        "scan_complete",
+        "metadata_updated"
+      ]
+    }
+  ]
+}
