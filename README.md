@@ -8,13 +8,15 @@ It reads only the box set data Silo already stores (title, overview, poster, bac
 
 On each run, for every movie library:
 
-1. Looks up which box set each movie belongs to. Answers are cached, so routine runs only look up new or refreshed movies.
+1. Looks up which box set each movie belongs to. One answer covers every movie in that box set, and answers are cached, so routine runs only look up new or refreshed movies.
 2. Creates a collection for each box set that forms. Silo forms a box set once the library has enough of its movies and box sets are turned on for the library.
 3. Keeps each collection's title, description and movies (in collection order) the same as its box set.
 4. Removes a collection once its box set no longer forms.
-5. Sets the box set's poster and backdrop on a collection only while the collection has none of its own. The plugin treats Silo's automatic collage as no poster.
+5. Gives each collection the box set's poster and backdrop, and swaps them when TMDB's artwork changes. If you upload your own image, it is left alone. An image that can't be fetched is tried again on the next run. Silo fetches the image itself when it can. Otherwise the plugin downloads and uploads it, for example when artwork is served from a storage server on your LAN.
 
-The plugin owns collections with the slug `box-set-<id>` and the group with the slug `box-sets`. It never touches other collections. You can still change visibility, featuring, placement and artwork as usual; only the title, description and movies are overwritten.
+A failure on one collection, such as a removal Silo refuses because a Home row still shows the collection, is listed in the task's output and the run moves on to the next collection.
+
+The plugin owns collections with the slug `box-set-<id>` and the group with the slug `box-sets`. It never touches other collections. You can still change visibility, featuring, placement and artwork as usual; only the title, description and movies are overwritten. Don't change a box set collection's slug: the plugin finds its collections by slug, so a renamed one is treated as yours and a new one is created alongside it.
 
 If you ran a Silo build with box set collections built in, those collections use the same slugs. The plugin adopts them instead of making duplicates.
 
@@ -23,10 +25,16 @@ If you ran a Silo build with box set collections built in, those collections use
 - **On a schedule, or when you press Run now** under **Admin → Scheduled Tasks**. This is a full run that looks up every movie again. By default the task runs at server start; add a daily schedule there.
 - **After library changes.** About 20 seconds after a library scan or a metadata refresh, a quick run checks new and refreshed movies. A burst of events gives one run.
 
+## Before you start
+
+- **The API key has full admin power.** Silo's API key scopes don't cover collections, so the key must have no scopes, and an unscoped key can do anything its account can. Use the server Owner account, keep the key for this plugin only, and revoke it in **Admin → API Keys** if you uninstall the plugin.
+- **The collections show what that account's primary profile can see.** Box sets are worked out per viewer, so if that profile has a rating limit or library restrictions, the movies it can't see are left out of the collections for everyone. Use an account whose primary profile has no limits. The Owner's usually doesn't.
+- **Turning box sets on, or lowering the minimum number of movies, shows up on the next full run.** Press Run now after changing either.
+
 ## Setup
 
 1. Turn on **Box sets** for your movie libraries in the library settings, if they are not on already.
-2. In **Admin → API Keys**, create a key with **no scopes** for the server Owner account, or for another administrator. Silo has no narrower scope that covers collections. Profile PINs don't matter, because API keys skip them. The Owner account is the best choice: other admins can't revoke or change keys on it.
+2. In **Admin → API Keys**, create a key with **no scopes** for the server Owner account, or for another administrator. Profile PINs don't matter, because API keys skip them. The Owner account is the best choice: other admins can't revoke or change keys on it.
 3. Install the plugin from **Admin → Plugins**, then paste the key under its **Settings**. You can also change the group name there. **Silo URL** is needed only if the plugin can't reach Silo on the address the server reports for itself.
 4. Under **Admin → Scheduled Tasks**, run **Sync box set collections** once and give it a daily schedule.
 
