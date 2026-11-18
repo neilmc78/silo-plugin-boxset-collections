@@ -3,10 +3,12 @@ package silo
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stub answers like Silo for the calls under test: every request needs the
@@ -101,4 +103,44 @@ func asError(err error, target **Error) bool {
 	e, ok := err.(*Error)
 	*target = e
 	return ok
+}
+
+func TestRetriesThrottledRequests(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		if calls <= 2 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if string(body) != `{"description":"d","title":"t"}` {
+			t.Errorf("retried body %q", body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "k")
+	if err := c.UpdateCollection(context.Background(), "c1", "t", "d"); err != nil || calls != 3 {
+		t.Fatalf("err %v after %d calls", err, calls)
+	}
+}
+
+func TestPacesRequests(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "k")
+	n := requestBurst + int(requestsPerSecond/2) // the burst, then half a second's worth
+	start := time.Now()
+	for range n {
+		if err := c.DeleteCollection(context.Background(), "c1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 400*time.Millisecond {
+		t.Fatalf("%d requests in %v: not paced under Silo's API key limit", n, elapsed)
+	}
 }

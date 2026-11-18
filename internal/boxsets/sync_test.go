@@ -41,6 +41,7 @@ type fakeAPI struct {
 	lookups     []string
 	boxSetReads int
 	deleteErr   error
+	lookupErr   map[string]error
 	sourceErr   error
 	uploads     []string
 	nextID      int
@@ -67,6 +68,9 @@ func (f *fakeAPI) Movies(context.Context, string) ([]string, error) {
 }
 func (f *fakeAPI) ItemBoxSet(ctx context.Context, cid, lib string) (*silo.BoxSet, error) {
 	f.lookups = append(f.lookups, cid)
+	if err := f.lookupErr[cid]; err != nil {
+		return nil, err
+	}
 	id := f.movieBoxSet[cid]
 	if id == "" {
 		return nil, nil
@@ -454,5 +458,51 @@ func TestSyncTakesOverTMDBArtworkFromTheCoreFeature(t *testing.T) {
 	}
 	if !slices.Equal(api.uploads, []string{"old:backdrop:source"}) {
 		t.Fatalf("uploads %v", api.uploads)
+	}
+}
+
+// Silo throttles API keys (429). A movie whose lookup failed is unknown,
+// not box-set-less: its box set's collection must survive.
+func TestSyncKeepsCollectionsWhenLookupsFail(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.boxSets["20"] = silo.BoxSet{ID: "20", Title: "Rocky"}
+	api.movieBoxSet = map[string]string{"a1": "10", "a2": "10", "r1": "20", "r2": "20"}
+	api.collections["c20"] = &silo.Collection{ID: "c20", Title: "Rocky", Slug: "box-set-20"}
+	throttled := &silo.Error{Status: 429, Body: "rate limited"}
+	api.lookupErr = map[string]error{"r1": throttled, "r2": throttled}
+
+	r, err := s.Sync(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api.collections["c20"] == nil || r.Removed != 0 {
+		t.Fatalf("deleted a collection whose movies could not be looked up: %+v", r)
+	}
+	if api.bySlug("box-set-10") == nil {
+		t.Fatalf("known box set not created: %+v", api.collections)
+	}
+	if !strings.Contains(strings.Join(r.Errors, "\n"), "removals skipped") {
+		t.Fatalf("report does not say removals were skipped: %v", r.Errors)
+	}
+}
+
+func TestSyncRefusesMassRemoval(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"a1": "10", "a2": "10"}
+	for i := range 8 {
+		id := fmt.Sprintf("old%d", i)
+		api.collections[id] = &silo.Collection{ID: id, Title: id, Slug: fmt.Sprintf("box-set-%d", 100+i)}
+	}
+	r, err := s.Sync(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Removed != 0 || len(api.collections) != 9 {
+		t.Fatalf("mass removal went ahead: removed %d, left %d", r.Removed, len(api.collections))
+	}
+	if !strings.Contains(strings.Join(r.Errors, "\n"), "removals skipped") {
+		t.Fatalf("report: %v", r.Errors)
 	}
 }

@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,12 +32,62 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("silo answered %d: %s", e.Status, strings.TrimSpace(e.Body))
 }
 
+// Silo rate-limits API keys: a standard-tier key gets 20 requests a second
+// with a burst of 20, and is answered 429 above that. The client keeps to
+// half of it, leaving room for anything else using the key.
+const (
+	requestsPerSecond = 10.0
+	requestBurst      = 10
+	maxRetries        = 4
+	maxRetryWait      = 30 * time.Second
+)
+
 // Client calls one Silo server with an API key, acting as one profile.
 type Client struct {
 	base      string
 	apiKey    string
 	profileID string
 	http      *http.Client
+	pace      *pacer
+}
+
+// pacer is a token bucket: Wait returns once a request may go.
+type pacer struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+}
+
+func newPacer() *pacer { return &pacer{tokens: requestBurst, last: time.Now()} }
+
+func (p *pacer) Wait(ctx context.Context) error {
+	for {
+		p.mu.Lock()
+		now := time.Now()
+		p.tokens = min(requestBurst, p.tokens+now.Sub(p.last).Seconds()*requestsPerSecond)
+		p.last = now
+		if p.tokens >= 1 {
+			p.tokens--
+			p.mu.Unlock()
+			return nil
+		}
+		wait := time.Duration((1 - p.tokens) / requestsPerSecond * float64(time.Second))
+		p.mu.Unlock()
+		if err := sleep(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // New returns a client for the server at base (for example
@@ -45,6 +97,7 @@ func New(base, apiKey string) *Client {
 		base:   strings.TrimRight(base, "/"),
 		apiKey: apiKey,
 		http:   &http.Client{Timeout: 60 * time.Second},
+		pace:   newPacer(),
 	}
 }
 
@@ -83,7 +136,7 @@ func (c *Client) send(req *http.Request, out any) error {
 	if c.profileID != "" {
 		req.Header.Set("X-Profile-Id", c.profileID)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.doPaced(req)
 	if err != nil {
 		return err
 	}
@@ -101,6 +154,44 @@ func (c *Client) send(req *http.Request, out any) error {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// doPaced sends a request to Silo within the rate limit, and retries one
+// Silo throttles (429) or cannot serve right now (503), waiting as long as
+// Retry-After asks, else 1s, 2s, 4s, 8s.
+func (c *Client) doPaced(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	for attempt := 0; ; attempt++ {
+		if err := c.pace.Wait(ctx); err != nil {
+			return nil, err
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusServiceUnavailable) ||
+			attempt == maxRetries || req.GetBody == nil && req.Body != nil {
+			return resp, nil
+		}
+		wait := retryAfter(resp.Header.Get("Retry-After"), attempt)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err := sleep(ctx, wait); err != nil {
+			return nil, err
+		}
+		if req.GetBody != nil {
+			if req.Body, err = req.GetBody(); err != nil {
+				return nil, err
+			}
+		}
+	}
+}
+
+func retryAfter(header string, attempt int) time.Duration {
+	if s, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && s >= 0 {
+		return min(time.Duration(s)*time.Second, maxRetryWait)
+	}
+	return min(time.Second<<attempt, maxRetryWait)
 }
 
 // Profile is one profile of the account the API key belongs to.
@@ -394,13 +485,19 @@ func (c *Client) Fetch(ctx context.Context, address string) ([]byte, string, err
 	if err != nil {
 		return nil, "", err
 	}
-	if !absolute || strings.HasPrefix(target, c.base+"/") {
+	own := !absolute || strings.HasPrefix(target, c.base+"/")
+	if own {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		if c.profileID != "" {
 			req.Header.Set("X-Profile-Id", c.profileID)
 		}
 	}
-	resp, err := c.http.Do(req)
+	var resp *http.Response
+	if own {
+		resp, err = c.doPaced(req)
+	} else {
+		resp, err = c.http.Do(req)
+	}
 	if err != nil {
 		return nil, "", err
 	}

@@ -37,6 +37,11 @@ const (
 	groupSlug            = "box-sets"
 )
 
+// massRemovalFloor is how many collections a run may always remove; above
+// it, a run that would remove more than half a library's box set
+// collections removes none.
+const massRemovalFloor = 5
+
 // eventDelay gathers the events of one scan (or a burst of metadata
 // refreshes) into one sync.
 var eventDelay = 20 * time.Second
@@ -300,6 +305,10 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	}
 	next := make(map[string]string, len(movies))
 	found := map[string]silo.BoxSet{}
+	// failed counts lookups and reads that failed this run. Any failure
+	// means some box sets are unknown rather than gone, so nothing is
+	// removed (see below).
+	failed := 0
 	for _, id := range movies {
 		if _, done := next[id]; done {
 			continue
@@ -317,6 +326,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			if boxSet, ok := cache[id]; ok {
 				next[id] = boxSet
 			}
+			failed++
 			report.addError(lib, "looking up %s: %v", id, err)
 			continue
 		}
@@ -359,6 +369,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			}
 			// Not knowing is not the same as gone: keep its collection.
 			unreadable[id] = true
+			failed++
 			report.addError(lib, "reading box set %s: %v", id, err)
 			continue
 		}
@@ -379,14 +390,28 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		}
 	}
 
-	// Collections whose box set no longer forms go. One that fails (Silo
-	// answers 409 while a Home row still shows it) is reported and the rest
-	// carry on.
+	// Collections whose box set no longer forms go, but only when this run
+	// knows every movie's box set: a failed lookup (Silo throttling the key,
+	// say) leaves box sets unknown, not gone. A run that would remove most
+	// of the library's box set collections is refused too, so no bug or
+	// outage can wipe them. One removal that fails (Silo answers 409 while a
+	// Home row still shows it) is reported and the rest carry on.
+	var remove []silo.Collection
 	for _, id := range sortedKeys(have) {
-		c := have[id]
-		if _, ok := want[id]; ok || unreadable[id] {
-			continue
+		if _, ok := want[id]; !ok && !unreadable[id] {
+			remove = append(remove, have[id])
 		}
+	}
+	switch {
+	case len(remove) == 0:
+	case failed > 0:
+		report.addError(lib, "removals skipped: %d lookups failed, so %d collections were kept until a run completes", failed, len(remove))
+		remove = nil
+	case len(remove) > massRemovalFloor && len(remove)*2 > len(have):
+		report.addError(lib, "removals skipped: %d of %d box set collections would go, more than half; if that is intended, delete them by hand", len(remove), len(have))
+		remove = nil
+	}
+	for _, c := range remove {
 		if err := api.DeleteCollection(ctx, c.ID); err != nil {
 			report.addError(lib, "removing %q: %v", c.Title, err)
 			continue
