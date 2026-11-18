@@ -40,12 +40,9 @@ func (host) BaseURL(ctx context.Context) (string, error) {
 	return "", errors.New("Silo reported no address for its API; set the Silo URL in the plugin's settings")
 }
 
-// nonMovieTypes are library types that never hold movies.
-var nonMovieTypes = map[string]bool{
-	"tv": true, "series": true, "shows": true, "audiobook": true, "audiobooks": true,
-	"ebook": true, "ebooks": true, "book": true, "books": true, "podcast": true, "podcasts": true,
-	"music": true, "manga": true,
-}
+// movieTypes are the library types that hold movies, as Silo's librarykind
+// classifies them: dedicated movie libraries and mixed ones.
+var movieTypes = map[string]bool{"movie": true, "movies": true, "mixed": true}
 
 func (host) MovieLibraries(ctx context.Context) ([]boxsets.Library, error) {
 	c, err := client()
@@ -58,7 +55,7 @@ func (host) MovieLibraries(ctx context.Context) ([]boxsets.Library, error) {
 	}
 	out := make([]boxsets.Library, 0, len(libs))
 	for _, l := range libs {
-		if nonMovieTypes[strings.ToLower(strings.TrimSpace(l.GetMediaType()))] {
+		if !movieTypes[strings.ToLower(strings.TrimSpace(l.GetMediaType()))] {
 			continue
 		}
 		out = append(out, boxsets.Library{ID: l.GetId(), Name: l.GetName()})

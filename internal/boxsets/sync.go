@@ -62,7 +62,7 @@ type API interface {
 	PrimaryProfile(ctx context.Context) (silo.Profile, error)
 	UseProfile(id string)
 	Movies(ctx context.Context, libraryID string) ([]string, error)
-	ItemBoxSetID(ctx context.Context, contentID, libraryID string) (string, error)
+	ItemBoxSet(ctx context.Context, contentID, libraryID string) (*silo.BoxSet, error)
 	BoxSet(ctx context.Context, id, libraryID string) (silo.BoxSet, error)
 	Collections(ctx context.Context, libraryID string) ([]silo.Collection, error)
 	Groups(ctx context.Context, libraryID string) ([]silo.Group, error)
@@ -75,7 +75,8 @@ type API interface {
 	RemoveMember(ctx context.Context, collectionID, contentID string) error
 	OrderMembers(ctx context.Context, collectionID string, contentIDs []string) error
 	Fetch(ctx context.Context, address string) ([]byte, string, error)
-	UploadArtwork(ctx context.Context, collectionID, kind string, image []byte, contentType string) error
+	UploadArtwork(ctx context.Context, collectionID, kind string, image []byte, contentType string) (silo.Collection, error)
+	SetArtworkSource(ctx context.Context, collectionID, kind, sourceURL string) (silo.Collection, error)
 }
 
 // Syncer is the plugin: a scheduled task (a full sync) and an event
@@ -285,44 +286,85 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	if err != nil {
 		return fmt.Errorf("listing movies: %w", err)
 	}
+	inLibrary := make(map[string]bool, len(movies))
+	for _, id := range movies {
+		inLibrary[id] = true
+	}
 
-	// Which box set each movie is in, looked up only for movies not cached.
+	// Which box set each movie is in. A lookup answers with the whole box
+	// set and its movies, so its siblings need no lookup of their own, and
+	// the box sets found this way need no second read.
 	cache, err := s.loadCache(ctx, lib.ID)
 	if err != nil {
 		return err
 	}
 	next := make(map[string]string, len(movies))
+	found := map[string]silo.BoxSet{}
 	for _, id := range movies {
+		if _, done := next[id]; done {
+			continue
+		}
 		if boxSet, ok := cache[id]; ok && !full && !stale[id] && !stale[lib.ID] {
 			next[id] = boxSet
 			continue
 		}
-		boxSet, err := api.ItemBoxSetID(ctx, id, lib.ID)
+		b, err := api.ItemBoxSet(ctx, id, lib.ID)
 		if err != nil {
-			return fmt.Errorf("looking up a movie's box set: %w", err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Keep what was known and try again next run.
+			if boxSet, ok := cache[id]; ok {
+				next[id] = boxSet
+			}
+			report.addError(lib, "looking up %s: %v", id, err)
+			continue
 		}
 		report.Looked++
-		next[id] = boxSet
+		if b == nil {
+			next[id] = ""
+			continue
+		}
+		next[id] = b.ID
+		for _, m := range b.Members {
+			if inLibrary[m] {
+				next[m] = b.ID
+			}
+		}
+		if len(b.Members) > 0 {
+			found[b.ID] = *b
+		}
 	}
 	if err := s.saveCache(ctx, lib.ID, next); err != nil {
 		return err
 	}
 
-	// The box sets that form in this library. Silo answers 404 for one the
-	// library has too few movies of, or when box sets are off.
+	// The box sets that form in this library. Ones known only from the
+	// cache are read; Silo answers 404 for one the library has too few
+	// movies of, or when box sets are off.
 	want := map[string]silo.BoxSet{}
+	unreadable := map[string]bool{}
 	for _, id := range distinctBoxSets(next) {
+		if b, ok := found[id]; ok {
+			want[id] = b
+			continue
+		}
 		b, err := api.BoxSet(ctx, id, lib.ID)
 		if errors.Is(err, silo.ErrNotFound) {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("reading box set %s: %w", id, err)
-		}
-		if len(b.Members) == 0 {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// Not knowing is not the same as gone: keep its collection.
+			unreadable[id] = true
+			report.addError(lib, "reading box set %s: %v", id, err)
 			continue
 		}
-		want[id] = b
+		if len(b.Members) > 0 {
+			want[id] = b
+		}
 	}
 	report.BoxSets += len(want)
 
@@ -337,14 +379,19 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		}
 	}
 
-	// Collections whose box set no longer forms go first.
-	for id, c := range have {
-		if _, ok := want[id]; ok {
+	// Collections whose box set no longer forms go. One that fails (Silo
+	// answers 409 while a Home row still shows it) is reported and the rest
+	// carry on.
+	for _, id := range sortedKeys(have) {
+		c := have[id]
+		if _, ok := want[id]; ok || unreadable[id] {
 			continue
 		}
 		if err := api.DeleteCollection(ctx, c.ID); err != nil {
-			return fmt.Errorf("removing %q: %w", c.Title, err)
+			report.addError(lib, "removing %q: %v", c.Title, err)
+			continue
 		}
+		s.forgetArtwork(ctx, c.ID)
 		report.Removed++
 	}
 	if len(want) == 0 {
@@ -356,6 +403,9 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		return err
 	}
 	for _, id := range sortedKeys(want) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		b := want[id]
 		c, exists := have[id]
 		if !exists {
@@ -364,13 +414,15 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 				Slug: collectionSlugPrefix + id, GroupID: groupID,
 			})
 			if err != nil {
-				return fmt.Errorf("creating %q: %w", b.Title, err)
+				report.addError(lib, "creating %q: %v", b.Title, err)
+				continue
 			}
 			report.Created++
 		}
 		changed, err := s.reconcile(ctx, api, c, b, exists)
 		if err != nil {
-			return fmt.Errorf("updating %q: %w", b.Title, err)
+			report.addError(lib, "updating %q: %v", b.Title, err)
+			continue
 		}
 		if exists && changed {
 			report.Updated++
@@ -379,9 +431,14 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	return nil
 }
 
+// addError records one failure in a library without stopping its sync.
+func (r *Report) addError(lib Library, format string, args ...any) {
+	r.Errors = append(r.Errors, lib.Name+": "+fmt.Sprintf(format, args...))
+}
+
 // reconcile makes one collection match its box set: title, description,
-// members in collection order, and artwork while the collection has none of
-// its own. It reports whether anything changed.
+// members in collection order, and artwork while it is the box set's (see
+// syncArtwork). It reports whether anything changed.
 func (s *Syncer) reconcile(ctx context.Context, api API, c silo.Collection, b silo.BoxSet, existed bool) (bool, error) {
 	changed := false
 	if existed && (c.Title != b.Title || c.Description != b.Overview) {
@@ -425,33 +482,115 @@ func (s *Syncer) reconcile(ctx context.Context, api API, c silo.Collection, b si
 		changed = true
 	}
 
-	// Artwork is set only where the collection has none of its own, so an
-	// admin's upload is never replaced.
-	if (c.PosterURL == "" || c.PosterIsCollage) && b.PosterURL != "" {
-		if ok := s.copyArtwork(ctx, api, c.ID, "poster", b.PosterURL); ok {
-			changed = true
-		}
-	}
-	if c.BackdropURL == "" && b.BackdropURL != "" {
-		if ok := s.copyArtwork(ctx, api, c.ID, "backdrop", b.BackdropURL); ok {
-			changed = true
-		}
+	if s.syncArtwork(ctx, api, c, b) {
+		changed = true
 	}
 	return changed, nil
 }
 
-// copyArtwork uploads a box set image to a collection. Artwork is not worth
-// failing the sync over, so a failure is logged and retried next time.
-func (s *Syncer) copyArtwork(ctx context.Context, api API, collectionID, kind, address string) bool {
+// artworkState remembers, per collection and kind, which box set image the
+// plugin set (Src) and what the collection's image was right after (Set).
+// While the collection still shows Set, the image is the plugin's to
+// replace when the box set's changes; anything else is the admin's.
+type artworkState map[string]artworkSlot
+
+type artworkSlot struct {
+	Src string `json:"src"`
+	Set string `json:"set"`
+}
+
+func artworkKey(collectionID string) string { return "art:" + collectionID }
+
+// syncArtwork sets the box set's poster and backdrop on a collection that has
+// none of its own, and replaces them when the box set's change. An image the
+// admin uploaded is never touched. Failures are logged, not fatal: artwork
+// is retried on the next run.
+func (s *Syncer) syncArtwork(ctx context.Context, api API, c silo.Collection, b silo.BoxSet) bool {
+	state := artworkState{}
+	if raw, ok, err := s.host.ReadState(ctx, artworkKey(c.ID)); err == nil && ok {
+		_ = json.Unmarshal(raw, &state)
+	}
+	changed := false
+	for _, a := range []struct {
+		kind, curURL, curHash, srcURL, srcHash string
+		collage                                bool
+	}{
+		{"poster", c.PosterURL, c.PosterHash, b.PosterURL, b.PosterThumbhash, c.PosterIsCollage},
+		{"backdrop", c.BackdropURL, c.BackdropHash, b.BackdropURL, b.BackdropThumbhash, false},
+	} {
+		if a.srcURL == "" {
+			continue
+		}
+		src := imageIdentity(a.srcURL, a.srcHash)
+		slot, known := state[a.kind]
+		empty := a.curURL == "" || a.collage
+		ours := empty ||
+			(known && slot.Set != "" && imageIdentity(a.curURL, a.curHash) == slot.Set) ||
+			// The core box set feature this plugin replaces stored TMDB's URL.
+			(!known && isTMDBImage(a.curURL))
+		if !ours || (!empty && known && slot.Src == src) {
+			continue
+		}
+		after, err := s.setArtwork(ctx, api, c.ID, a.kind, a.srcURL)
+		if err != nil {
+			s.log.Warn("box set collections: could not set artwork", "collection", c.Title, "kind", a.kind, "error", err)
+			continue
+		}
+		set := imageIdentity(after.PosterURL, after.PosterHash)
+		if a.kind == "backdrop" {
+			set = imageIdentity(after.BackdropURL, after.BackdropHash)
+		}
+		state[a.kind] = artworkSlot{Src: src, Set: set}
+		changed = true
+	}
+	if changed {
+		if raw, err := json.Marshal(state); err == nil {
+			if err := s.host.WriteState(ctx, artworkKey(c.ID), raw); err != nil {
+				s.log.Warn("box set collections: could not save artwork state", "error", err)
+			}
+		}
+	}
+	return changed
+}
+
+// setArtwork has Silo fetch the image itself, which saves the plugin a
+// download and an upload. Silo refuses private addresses and relative
+// ones, so those (a LAN storage server's signed URL, Silo's own image
+// proxy) are downloaded and uploaded instead.
+func (s *Syncer) setArtwork(ctx context.Context, api API, collectionID, kind, address string) (silo.Collection, error) {
+	if strings.HasPrefix(address, "https://") || strings.HasPrefix(address, "http://") {
+		if c, err := api.SetArtworkSource(ctx, collectionID, kind, address); err == nil {
+			return c, nil
+		}
+	}
 	image, contentType, err := api.Fetch(ctx, address)
-	if err == nil {
-		err = api.UploadArtwork(ctx, collectionID, kind, image, contentType)
-	}
 	if err != nil {
-		s.log.Warn("box set collections: could not copy artwork", "collection", collectionID, "kind", kind, "error", err)
-		return false
+		return silo.Collection{}, err
 	}
-	return true
+	return api.UploadArtwork(ctx, collectionID, kind, image, contentType)
+}
+
+func (s *Syncer) forgetArtwork(ctx context.Context, collectionID string) {
+	_ = s.host.WriteState(ctx, artworkKey(collectionID), []byte("{}"))
+}
+
+// imageIdentity names an image stably: its thumbhash when Silo has one, else
+// its address without the signature query, which changes on every read.
+func imageIdentity(address, thumbhash string) string {
+	if thumbhash != "" {
+		return "th:" + thumbhash
+	}
+	if address == "" {
+		return ""
+	}
+	if i := strings.IndexByte(address, '?'); i >= 0 {
+		address = address[:i]
+	}
+	return "url:" + address
+}
+
+func isTMDBImage(address string) bool {
+	return strings.HasPrefix(address, "https://image.tmdb.org/") || strings.HasPrefix(address, "http://image.tmdb.org/")
 }
 
 func ensureGroup(ctx context.Context, api API, libraryID, name string) (string, error) {
@@ -489,7 +628,7 @@ func distinctBoxSets(byMovie map[string]string) []string {
 	return out
 }
 
-func sortedKeys(m map[string]silo.BoxSet) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

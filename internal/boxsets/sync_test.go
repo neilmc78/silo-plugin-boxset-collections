@@ -39,6 +39,9 @@ type fakeAPI struct {
 	members     map[string][]string
 	groups      []silo.Group
 	lookups     []string
+	boxSetReads int
+	deleteErr   error
+	sourceErr   error
 	uploads     []string
 	nextID      int
 }
@@ -62,11 +65,24 @@ func (f *fakeAPI) Movies(context.Context, string) ([]string, error) {
 	slices.Sort(out)
 	return out, nil
 }
-func (f *fakeAPI) ItemBoxSetID(_ context.Context, cid, _ string) (string, error) {
+func (f *fakeAPI) ItemBoxSet(ctx context.Context, cid, lib string) (*silo.BoxSet, error) {
 	f.lookups = append(f.lookups, cid)
-	return f.movieBoxSet[cid], nil
+	id := f.movieBoxSet[cid]
+	if id == "" {
+		return nil, nil
+	}
+	b, err := f.boxSet(id)
+	if err != nil {
+		return nil, nil
+	}
+	return &b, nil
 }
 func (f *fakeAPI) BoxSet(_ context.Context, id, _ string) (silo.BoxSet, error) {
+	f.boxSetReads++
+	return f.boxSet(id)
+}
+
+func (f *fakeAPI) boxSet(id string) (silo.BoxSet, error) {
 	b, ok := f.boxSets[id]
 	if !ok {
 		return silo.BoxSet{}, silo.ErrNotFound
@@ -107,6 +123,9 @@ func (f *fakeAPI) UpdateCollection(_ context.Context, id, title, desc string) er
 	return nil
 }
 func (f *fakeAPI) DeleteCollection(_ context.Context, id string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.collections, id)
 	delete(f.members, id)
 	return nil
@@ -129,14 +148,29 @@ func (f *fakeAPI) OrderMembers(_ context.Context, id string, ids []string) error
 func (f *fakeAPI) Fetch(_ context.Context, address string) ([]byte, string, error) {
 	return []byte(address), "image/jpeg", nil
 }
-func (f *fakeAPI) UploadArtwork(_ context.Context, id, kind string, _ []byte, _ string) error {
-	f.uploads = append(f.uploads, id+":"+kind)
-	if kind == "poster" {
-		f.collections[id].PosterURL = "uploaded"
-	} else {
-		f.collections[id].BackdropURL = "uploaded"
+func (f *fakeAPI) UploadArtwork(_ context.Context, id, kind string, image []byte, _ string) (silo.Collection, error) {
+	f.uploads = append(f.uploads, id+":"+kind+":upload")
+	return f.setArt(id, kind, string(image)), nil
+}
+func (f *fakeAPI) SetArtworkSource(_ context.Context, id, kind, src string) (silo.Collection, error) {
+	if f.sourceErr != nil {
+		return silo.Collection{}, f.sourceErr
 	}
-	return nil
+	f.uploads = append(f.uploads, id+":"+kind+":source")
+	return f.setArt(id, kind, src), nil
+}
+
+// setArt stores an image the way Silo does: a new stored path whose
+// thumbhash follows the image.
+func (f *fakeAPI) setArt(id, kind, src string) silo.Collection {
+	c := f.collections[id]
+	stored, hash := "/stored/"+f.id("img"), "hash-of-"+strings.SplitN(src, "?", 2)[0]
+	if kind == "poster" {
+		c.PosterURL, c.PosterHash, c.PosterIsCollage = stored+"?sig=1", hash, false
+	} else {
+		c.BackdropURL, c.BackdropHash = stored+"?sig=1", hash
+	}
+	return *c
 }
 
 func setup(t *testing.T) (*Syncer, *fakeAPI, *fakeHost) {
@@ -242,7 +276,7 @@ func TestSyncAdoptsExistingCollectionAndKeepsUploadedArt(t *testing.T) {
 	if _, err := s.Sync(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(api.uploads, []string{"old:poster"}) {
+	if !slices.Equal(api.uploads, []string{"old:poster:upload"}) {
 		t.Fatalf("uploads %v", api.uploads)
 	}
 }
@@ -320,5 +354,105 @@ func TestCacheRoundTripsAcrossChunks(t *testing.T) {
 	got, err := s.loadCache(ctx, "lib")
 	if err != nil || len(got) != len(m) || got["m00004"] != "1" {
 		t.Fatalf("got %d entries, err %v", len(got), err)
+	}
+}
+
+func TestSyncLooksUpEachBoxSetOnce(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10", "m3": "10", "m4": ""}
+	if _, err := s.Sync(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	// m1 answers for its siblings m2 and m3; m4 has no box set.
+	if !slices.Equal(api.lookups, []string{"m1", "m4"}) || api.boxSetReads != 0 {
+		t.Fatalf("lookups %v, box set reads %d", api.lookups, api.boxSetReads)
+	}
+	// A quick run reads cached box sets once each.
+	api.lookups = nil
+	if _, err := s.Sync(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.lookups) != 0 || api.boxSetReads != 1 {
+		t.Fatalf("lookups %v, box set reads %d", api.lookups, api.boxSetReads)
+	}
+}
+
+func TestSyncCarriesOnPastAFailedRemoval(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10"}
+	api.collections["gone"] = &silo.Collection{ID: "gone", Title: "Gone", Slug: "box-set-99"}
+	api.deleteErr = &silo.Error{Status: 409, Body: "used by a page section"}
+
+	r, err := s.Sync(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Created != 1 || r.Removed != 0 || len(r.Errors) != 1 || !strings.Contains(r.Errors[0], "Gone") {
+		t.Fatalf("report %+v", r)
+	}
+}
+
+func TestSyncArtworkFollowsTheBoxSet(t *testing.T) {
+	s, api, _ := setup(t)
+	ctx := context.Background()
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien",
+		PosterURL: "https://img.example/p1?sig=a", PosterThumbhash: "P1"}
+	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10"}
+	if _, err := s.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	c := api.bySlug("box-set-10")
+	if !slices.Equal(api.uploads, []string{c.ID + ":poster:source"}) {
+		t.Fatalf("uploads %v", api.uploads)
+	}
+
+	// Same image under a fresh signature: nothing to do.
+	b := api.boxSets["10"]
+	b.PosterURL = "https://img.example/p1?sig=b"
+	api.boxSets["10"] = b
+	if _, err := s.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.uploads) != 1 {
+		t.Fatalf("re-set an unchanged poster: %v", api.uploads)
+	}
+
+	// TMDB has a new poster: the plugin's poster follows it. Silo refuses
+	// the source (a private address), so the bytes are uploaded.
+	b.PosterURL, b.PosterThumbhash = "https://img.example/p2", "P2"
+	api.boxSets["10"] = b
+	api.sourceErr = &silo.Error{Status: 422, Body: "not allowed"}
+	if _, err := s.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.uploads) != 2 || api.uploads[1] != c.ID+":poster:upload" {
+		t.Fatalf("uploads %v", api.uploads)
+	}
+
+	// The admin uploads their own; a later box set change leaves it alone.
+	c.PosterURL, c.PosterHash = "/stored/admin", "ADMIN"
+	b.PosterURL, b.PosterThumbhash = "https://img.example/p3", "P3"
+	api.boxSets["10"] = b
+	if _, err := s.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.uploads) != 2 || c.PosterHash != "ADMIN" {
+		t.Fatalf("replaced the admin's poster: %v", api.uploads)
+	}
+}
+
+func TestSyncTakesOverTMDBArtworkFromTheCoreFeature(t *testing.T) {
+	s, api, _ := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien", BackdropURL: "https://img.example/b", BackdropThumbhash: "B"}
+	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10"}
+	api.collections["old"] = &silo.Collection{ID: "old", Title: "Alien", Slug: "box-set-10",
+		BackdropURL: "https://image.tmdb.org/t/p/original/x.jpg"}
+	if _, err := s.Sync(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(api.uploads, []string{"old:backdrop:source"}) {
+		t.Fatalf("uploads %v", api.uploads)
 	}
 }

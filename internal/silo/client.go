@@ -168,6 +168,9 @@ type BoxSet struct {
 	Overview    string
 	PosterURL   string
 	BackdropURL string
+	// The thumbhashes identify the artwork while its signed URLs change.
+	PosterThumbhash   string
+	BackdropThumbhash string
 	// Members are the content IDs of its movies in the library, in
 	// collection order.
 	Members []string
@@ -179,13 +182,16 @@ type boxSetDetail struct {
 	Overview    string `json:"overview"`
 	PosterURL   string `json:"poster_url"`
 	BackdropURL string `json:"backdrop_url"`
+	PosterHash  string `json:"poster_thumbhash"`
+	BackHash    string `json:"backdrop_thumbhash"`
 	Items       []struct {
 		ContentID string `json:"content_id"`
 	} `json:"items"`
 }
 
 func (d boxSetDetail) boxSet() BoxSet {
-	b := BoxSet{ID: d.ID, Title: d.Title, Overview: d.Overview, PosterURL: d.PosterURL, BackdropURL: d.BackdropURL}
+	b := BoxSet{ID: d.ID, Title: d.Title, Overview: d.Overview, PosterURL: d.PosterURL, BackdropURL: d.BackdropURL,
+		PosterThumbhash: d.PosterHash, BackdropThumbhash: d.BackHash}
 	for _, it := range d.Items {
 		if it.ContentID != "" {
 			b.Members = append(b.Members, it.ContentID)
@@ -199,23 +205,23 @@ func artworkQuery(libraryID string) url.Values {
 	return url.Values{"library_id": {libraryID}, "poster_width": {"780"}, "backdrop_width": {"1280"}}
 }
 
-// ItemBoxSetID returns the ID of the box set a movie belongs to in a
-// library, or "" when it belongs to none (or the library has box sets off).
-func (c *Client) ItemBoxSetID(ctx context.Context, contentID, libraryID string) (string, error) {
+// ItemBoxSet returns the box set a movie belongs to in a library, with its
+// movies, or nil when it belongs to none that forms there (too few movies,
+// or box sets off).
+func (c *Client) ItemBoxSet(ctx context.Context, contentID, libraryID string) (*BoxSet, error) {
 	var out struct {
-		BoxSet *struct {
-			ID string `json:"id"`
-		} `json:"box_set"`
+		BoxSet *boxSetDetail `json:"box_set"`
 	}
 	err := c.do(ctx, http.MethodGet, "/api/v2/catalog/items/"+url.PathEscape(contentID)+"/box-set",
-		url.Values{"library_id": {libraryID}}, nil, &out, nil)
+		artworkQuery(libraryID), nil, &out, nil)
 	if errors.Is(err, ErrNotFound) {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil || out.BoxSet == nil {
-		return "", err
+		return nil, err
 	}
-	return out.BoxSet.ID, nil
+	b := out.BoxSet.boxSet()
+	return &b, nil
 }
 
 // BoxSet returns one box set of a library, or ErrNotFound when the library
@@ -238,7 +244,9 @@ type Collection struct {
 	GroupID         *string `json:"group_id"`
 	PosterURL       string  `json:"poster_url"`
 	PosterIsCollage bool    `json:"poster_is_collage"`
+	PosterHash      string  `json:"poster_thumbhash"`
 	BackdropURL     string  `json:"backdrop_url"`
+	BackdropHash    string  `json:"backdrop_thumbhash"`
 	ManagementMode  string  `json:"management_mode"`
 }
 
@@ -302,15 +310,20 @@ func (c *Client) CreateCollection(ctx context.Context, n NewCollection) (Collect
 	return out, err
 }
 
+// ifMatchAny satisfies the precondition Silo requires on guarded writes
+// (PATCH and DELETE of a collection, member reorder); without it they answer
+// 428. The plugin owns these collections, so it overwrites unconditionally.
+var ifMatchAny = map[string]string{"If-Match": "*"}
+
 // UpdateCollection patches a collection's title and description.
 func (c *Client) UpdateCollection(ctx context.Context, id, title, description string) error {
 	in := map[string]any{"title": title, "description": description}
-	return c.do(ctx, http.MethodPatch, "/api/v2/admin/collections/"+url.PathEscape(id), nil, in, nil, nil)
+	return c.do(ctx, http.MethodPatch, "/api/v2/admin/collections/"+url.PathEscape(id), nil, in, nil, ifMatchAny)
 }
 
 // DeleteCollection deletes a collection.
 func (c *Client) DeleteCollection(ctx context.Context, id string) error {
-	err := c.do(ctx, http.MethodDelete, "/api/v2/admin/collections/"+url.PathEscape(id), nil, nil, nil, nil)
+	err := c.do(ctx, http.MethodDelete, "/api/v2/admin/collections/"+url.PathEscape(id), nil, nil, nil, ifMatchAny)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -365,7 +378,7 @@ func (c *Client) RemoveMember(ctx context.Context, collectionID, contentID strin
 // OrderMembers sets the order of a collection's members.
 func (c *Client) OrderMembers(ctx context.Context, collectionID string, contentIDs []string) error {
 	return c.do(ctx, http.MethodPut, "/api/v2/admin/collections/"+url.PathEscape(collectionID)+"/items/order",
-		nil, map[string]any{"ordered_ids": contentIDs}, nil, map[string]string{"If-Match": "*"})
+		nil, map[string]any{"ordered_ids": contentIDs}, nil, ifMatchAny)
 }
 
 // Fetch downloads an image Silo pointed at. A relative address is on this
@@ -403,33 +416,51 @@ func (c *Client) Fetch(ctx context.Context, address string) ([]byte, string, err
 }
 
 // UploadArtwork sets a collection's poster or backdrop ("poster" or
-// "backdrop") from image bytes.
-func (c *Client) UploadArtwork(ctx context.Context, collectionID, kind string, image []byte, contentType string) error {
+// "backdrop") from image bytes, and returns the collection after it.
+func (c *Client) UploadArtwork(ctx context.Context, collectionID, kind string, image []byte, contentType string) (Collection, error) {
 	if contentType == "" {
 		contentType = http.DetectContentType(image)
 	}
+	return c.putArtwork(ctx, collectionID, kind, func(w *multipart.Writer) error {
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Disposition", `form-data; name="image"; filename="`+kind+extension(contentType)+`"`)
+		h.Set("Content-Type", contentType)
+		part, err := w.CreatePart(h)
+		if err != nil {
+			return err
+		}
+		_, err = part.Write(image)
+		return err
+	})
+}
+
+// SetArtworkSource has Silo download a collection's poster or backdrop from
+// an absolute URL itself. Silo refuses private addresses, so a signed URL on
+// a LAN storage server fails here and the caller uploads the bytes instead.
+func (c *Client) SetArtworkSource(ctx context.Context, collectionID, kind, sourceURL string) (Collection, error) {
+	return c.putArtwork(ctx, collectionID, kind, func(w *multipart.Writer) error {
+		return w.WriteField("source_url", sourceURL)
+	})
+}
+
+func (c *Client) putArtwork(ctx context.Context, collectionID, kind string, fill func(*multipart.Writer) error) (Collection, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	h := make(textproto.MIMEHeader)
-	h.Set("Content-Disposition", `form-data; name="image"; filename="`+kind+extension(contentType)+`"`)
-	h.Set("Content-Type", contentType)
-	part, err := w.CreatePart(h)
-	if err != nil {
-		return err
-	}
-	if _, err := part.Write(image); err != nil {
-		return err
+	if err := fill(w); err != nil {
+		return Collection{}, err
 	}
 	if err := w.Close(); err != nil {
-		return err
+		return Collection{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
 		c.base+"/api/v2/admin/collections/"+url.PathEscape(collectionID)+"/"+kind, &buf)
 	if err != nil {
-		return err
+		return Collection{}, err
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	return c.send(req, nil)
+	var out Collection
+	err = c.send(req, &out)
+	return out, err
 }
 
 func extension(contentType string) string {
