@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -15,17 +17,24 @@ import (
 	"github.com/neilmc78/silo-plugin-boxset-collections/internal/silo"
 )
 
-type fakeHost struct{ state map[string][]byte }
+type fakeHost struct {
+	mu    sync.Mutex
+	state map[string][]byte
+}
 
 func (h *fakeHost) BaseURL(context.Context) (string, error) { return "http://silo", nil }
 func (h *fakeHost) MovieLibraries(context.Context) ([]Library, error) {
 	return []Library{{ID: "lib", Name: "Movies"}}, nil
 }
 func (h *fakeHost) ReadState(_ context.Context, k string) ([]byte, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	v, ok := h.state[k]
 	return v, ok, nil
 }
 func (h *fakeHost) WriteState(_ context.Context, k string, v []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.state[k] = v
 	return nil
 }
@@ -43,6 +52,7 @@ type fakeAPI struct {
 	deleteErr   error
 	lookupErr   map[string]error
 	readErr     map[string]error
+	slowMovies  time.Duration
 	sourceErr   error
 	uploads     []string
 	nextID      int
@@ -60,6 +70,7 @@ func (f *fakeAPI) PrimaryProfile(context.Context) (silo.Profile, error) {
 }
 func (f *fakeAPI) UseProfile(string) {}
 func (f *fakeAPI) Movies(context.Context, string) ([]string, error) {
+	time.Sleep(f.slowMovies)
 	var out []string
 	for id := range f.movieBoxSet {
 		out = append(out, id)
@@ -531,4 +542,43 @@ func TestSyncRemovesOnlyOnSilosWord(t *testing.T) {
 	if api.collections["c40"] != nil || r.Removed != 1 {
 		t.Fatalf("box set 40 does not form (404) and should go: %+v", r)
 	}
+}
+
+// Silo gives a scheduled task 10 seconds to answer (DefaultControlTimeout),
+// so Run must answer at once and sync in the background, unaffected by the
+// call's deadline.
+func TestRunSyncsInTheBackground(t *testing.T) {
+	s, api, host := setup(t)
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"a1": "10", "a2": "10"}
+	api.slowMovies = 200 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	resp, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{})
+	if err != nil || time.Since(start) > 40*time.Millisecond {
+		t.Fatalf("Run took %v, err %v", time.Since(start), err)
+	}
+	if got := resp.GetOutput().AsMap()["status"]; got != "started" {
+		t.Fatalf("status %v", got)
+	}
+	again, _ := s.Run(context.Background(), &pluginv1.RunScheduledTaskRequest{})
+	if got := again.GetOutput().AsMap()["status"]; got != "already running" {
+		t.Fatalf("second Run status %v", got)
+	}
+
+	s.wg.Wait()
+	if api.bySlug("box-set-10") == nil {
+		t.Fatal("background sync did not create the collection")
+	}
+	if _, ok, _ := host.ReadState(context.Background(), "last_report"); !ok {
+		t.Fatal("report not saved")
+	}
+	next, _ := s.Run(context.Background(), &pluginv1.RunScheduledTaskRequest{})
+	last, _ := next.GetOutput().AsMap()["last_run"].(map[string]any)
+	if last["created"] != float64(1) {
+		t.Fatalf("last_run %v", next.GetOutput().AsMap())
+	}
+	s.wg.Wait()
 }

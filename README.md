@@ -23,6 +23,8 @@ If you ran a Silo build with box set collections built in, those collections use
 ## When it runs
 
 - **On a schedule, or when you press Run now** under **Admin → Scheduled Tasks**. This is a full run that looks up every movie again. By default the task runs at server start; add a daily schedule there.
+
+  Silo gives a plugin task 10 seconds to answer, so the task starts the sync in the background and reports success straight away. Collections appear over the next minute or two. The sync's result goes to Silo's log, and the task's result shows the previous sync's report (`last_run`: what was created, updated and removed, and any problems).
 - **After library changes.** About 20 seconds after a library scan or a metadata refresh, a quick run checks new and refreshed movies. A burst of events gives one run.
 
 ## Before you start

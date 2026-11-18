@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
@@ -99,6 +101,11 @@ type Syncer struct {
 
 	runMu sync.Mutex // one sync at a time
 
+	// running is set while a Run's background sync is going; wg lets tests
+	// wait for it.
+	running atomic.Bool
+	wg      sync.WaitGroup
+
 	pending sync.Mutex // guards timer and stale
 	timer   *time.Timer
 	// stale holds movies a metadata refresh touched since the last sync;
@@ -133,14 +140,76 @@ func (s *Syncer) config() Config {
 }
 
 // Run is the scheduled task: a full sync that looks every movie up again,
-// so drift the events missed is corrected.
+// so drift the events missed is corrected. Silo gives the call 10 seconds
+// (its plugin control timeout), far less than a sync of a large library
+// takes, so Run starts the sync in the background and answers at once. Its
+// output carries the previous sync's report; each sync's own report is
+// logged and saved when it finishes.
 func (s *Syncer) Run(ctx context.Context, _ *pluginv1.RunScheduledTaskRequest) (*pluginv1.RunScheduledTaskResponse, error) {
-	report, err := s.Sync(ctx, true)
+	out := map[string]any{"status": "started"}
+	if last := s.lastReport(ctx); last != nil {
+		out["last_run"] = last
+	}
+	if !s.running.CompareAndSwap(false, true) {
+		out["status"] = "already running"
+	} else {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer s.running.Store(false)
+			bg, cancel := context.WithTimeout(context.Background(), syncTimeout)
+			defer cancel()
+			s.syncAndRecord(bg, true)
+		}()
+	}
+	output, err := structpb.NewStruct(out)
 	if err != nil {
 		return nil, err
 	}
-	out, _ := structpb.NewStruct(report.Map())
-	return &pluginv1.RunScheduledTaskResponse{Output: out}, nil
+	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
+}
+
+// syncTimeout bounds one background sync.
+const syncTimeout = time.Hour
+
+const lastReportKey = "last_report"
+
+// syncAndRecord runs a sync, then logs and saves its report for the next
+// Run's output.
+func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
+	start := time.Now()
+	report, err := s.Sync(ctx, full)
+	record := report.Map()
+	record["full"] = full
+	record["finished_at"] = time.Now().UTC().Format(time.RFC3339)
+	record["duration_seconds"] = int(time.Since(start).Seconds())
+	if err != nil {
+		record["error"] = err.Error()
+		s.log.Warn("box set collections: sync failed", "error", err, "full", full)
+	} else if len(report.Errors) > 0 {
+		s.log.Warn("box set collections: sync finished with problems", "problems", len(report.Errors), "first", report.Errors[0])
+	}
+	raw, mErr := json.Marshal(record)
+	if mErr == nil {
+		// The call's context may be spent; the record still matters.
+		wctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if wErr := s.host.WriteState(wctx, lastReportKey, raw); wErr != nil {
+			s.log.Warn("box set collections: could not save the sync report", "error", wErr)
+		}
+	}
+}
+
+func (s *Syncer) lastReport(ctx context.Context) map[string]any {
+	raw, ok, err := s.host.ReadState(ctx, lastReportKey)
+	if err != nil || !ok {
+		return nil
+	}
+	var out map[string]any
+	if json.Unmarshal(raw, &out) != nil {
+		return nil
+	}
+	return out
 }
 
 // HandleEvent answers at once (the host allows a few seconds) and syncs in
@@ -174,11 +243,9 @@ func (s *Syncer) schedule() {
 		s.pending.Lock()
 		s.timer = nil
 		s.pending.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), syncTimeout)
 		defer cancel()
-		if _, err := s.Sync(ctx, false); err != nil {
-			s.log.Warn("box set collections: sync after a library change failed", "error", err)
-		}
+		s.syncAndRecord(ctx, false)
 	})
 }
 
@@ -209,13 +276,15 @@ type Report struct {
 
 // Map is the report as a scheduled task's output.
 func (r Report) Map() map[string]any {
-	errs := make([]any, len(r.Errors))
-	for i, e := range r.Errors {
+	// The first problems are enough to act on; the count says how many.
+	shown := r.Errors[:min(len(r.Errors), 20)]
+	errs := make([]any, len(shown))
+	for i, e := range shown {
 		errs[i] = e
 	}
 	return map[string]any{
 		"libraries": r.Libraries, "movies_looked_up": r.Looked, "box_sets": r.BoxSets,
-		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs,
+		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
 	}
 }
 
@@ -331,6 +400,14 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			continue
 		}
 		report.Looked++
+		if report.Looked%cacheSaveEvery == 0 {
+			// Keep progress, so a sync stopped part way resumes from here.
+			partial := maps.Clone(cache)
+			maps.Copy(partial, next)
+			if err := s.saveCache(ctx, lib.ID, partial); err != nil {
+				return err
+			}
+		}
 		if b == nil {
 			next[id] = ""
 			continue
@@ -677,6 +754,10 @@ func sortedKeys[V any](m map[string]V) []string {
 // kept in the host's instance state, split into chunks that stay well under
 // the host's per-key limit.
 const cacheChunk = 2500
+
+// cacheSaveEvery is how many lookups pass between saves of the cache during
+// a sync.
+const cacheSaveEvery = 200
 
 func cacheKey(libraryID string, n int) string { return fmt.Sprintf("cache:%s:%d", libraryID, n) }
 func cacheCountKey(libraryID string) string   { return "cache:" + libraryID + ":chunks" }
