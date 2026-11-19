@@ -45,6 +45,10 @@ func (host) BaseURL(ctx context.Context) (string, error) {
 var movieTypes = map[string]bool{"movie": true, "movies": true, "mixed": true}
 
 func (host) MovieLibraries(ctx context.Context) ([]boxsets.Library, error) {
+	return libraries(ctx, movieTypes)
+}
+
+func libraries(ctx context.Context, types map[string]bool) ([]boxsets.Library, error) {
 	c, err := client()
 	if err != nil {
 		return nil, err
@@ -55,12 +59,20 @@ func (host) MovieLibraries(ctx context.Context) ([]boxsets.Library, error) {
 	}
 	out := make([]boxsets.Library, 0, len(libs))
 	for _, l := range libs {
-		if !movieTypes[strings.ToLower(strings.TrimSpace(l.GetMediaType()))] {
+		if !types[strings.ToLower(strings.TrimSpace(l.GetMediaType()))] {
 			continue
 		}
 		out = append(out, boxsets.Library{ID: l.GetId(), Name: l.GetName()})
 	}
 	return out, nil
+}
+
+// seriesTypes are the library types that hold series: dedicated series
+// libraries and mixed ones.
+var seriesTypes = map[string]bool{"series": true, "tv": true, "show": true, "tvshows": true, "mixed": true}
+
+func (host) SeriesLibraries(ctx context.Context) ([]boxsets.Library, error) {
+	return libraries(ctx, seriesTypes)
 }
 
 func (host) ReadState(ctx context.Context, key string) ([]byte, bool, error) {

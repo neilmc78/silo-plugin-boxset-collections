@@ -3,9 +3,16 @@ package main
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 )
 
 func TestManifest(t *testing.T) {
+	// The SDK validates the manifest when the plugin starts, and panics on
+	// a bad one: validate it here first.
+	if _, err := manifest.LoadWithChecksum(manifestJSON, "1.0.0"); err != nil {
+		t.Fatalf("the SDK rejects the manifest: %v", err)
+	}
 	var m struct {
 		PluginID     string `json:"plugin_id"`
 		Capabilities []struct {

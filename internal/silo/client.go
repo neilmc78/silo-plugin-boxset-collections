@@ -252,6 +252,46 @@ func (c *Client) Movies(ctx context.Context, libraryID string) ([]string, error)
 	}
 }
 
+// SeriesRef is one series of a library with its TheTVDB ID ("" when it has
+// none).
+type SeriesRef struct {
+	ContentID string
+	TvdbID    string
+}
+
+// Series returns every series in a library with its TheTVDB ID.
+func (c *Client) Series(ctx context.Context, libraryID string) ([]SeriesRef, error) {
+	var out []SeriesRef
+	cursor := ""
+	for {
+		q := url.Values{"library_id": {libraryID}, "type": {"series"}, "limit": {"200"}, "skip_total": {"true"}}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		var page struct {
+			Items []struct {
+				ContentID string `json:"content_id"`
+				TvdbID    string `json:"tvdb_id"`
+			} `json:"items"`
+			Page struct {
+				NextCursor string `json:"next_cursor"`
+			} `json:"page"`
+		}
+		if err := c.do(ctx, http.MethodGet, "/api/v2/catalog", q, nil, &page, nil); err != nil {
+			return nil, err
+		}
+		for _, it := range page.Items {
+			if it.ContentID != "" {
+				out = append(out, SeriesRef{ContentID: it.ContentID, TvdbID: strings.TrimSpace(it.TvdbID)})
+			}
+		}
+		if page.Page.NextCursor == "" || page.Page.NextCursor == cursor || len(page.Items) == 0 {
+			return out, nil
+		}
+		cursor = page.Page.NextCursor
+	}
+}
+
 // BoxSet is one box set of a library, as Silo stores it.
 type BoxSet struct {
 	ID          string

@@ -4,6 +4,10 @@ A Silo plugin that shows every box set as a collection. Each box set Silo has fo
 
 It reads only the box set data Silo already stores (title, overview, poster, backdrop and movies), so it makes no TMDB requests of its own.
 
+Optionally, with your own free TheTVDB API key, it does the same for TV: each series library gets a **Franchises** group with one collection per official TheTVDB list that holds enough of the library's series, such as [Yellowstone](https://thetvdb.com/lists/yellowstone). See [TV franchises](#tv-franchises).
+
+Series franchise data is provided by [TheTVDB.com](https://thetvdb.com). Please consider adding missing information or subscribing.
+
 ## What it does
 
 On each run, for every movie library:
@@ -19,6 +23,30 @@ A failure on one collection, such as a removal Silo refuses because a Home row s
 The plugin owns collections with the slug `box-set-<id>` and the group with the slug `box-sets`. It never touches other collections. You can still change visibility, featuring, placement and artwork as usual; only the title, description and movies are overwritten. Don't change a box set collection's slug: the plugin finds its collections by slug, so a renamed one is treated as yours and a new one is created alongside it.
 
 If you ran a Silo build with box set collections built in, those collections use the same slugs. The plugin adopts them instead of making duplicates.
+
+## TV franchises
+
+TV franchises are off until you set a TheTVDB API key. With a key, on each run, for every series library (and mixed library):
+
+1. Reads each series' TheTVDB ID from Silo. Series Silo has no TheTVDB ID for are skipped and counted in the task's output (`series_without_tvdb_id`).
+2. Asks TheTVDB which **official** lists each series is on. Lists anyone can make, such as "My favourites", are ignored. Answers are cached: quick runs only look up new or refreshed series, and full runs look a series up again after a week.
+3. Creates a collection for each official list that holds at least **Minimum series per franchise** (default 2) of the library's series. It holds those series in the list's order, and only series: films on the same list stay with your movie box sets.
+4. Keeps the title, description, series and the list's artwork up to date, and removes a collection once its list no longer qualifies, with the same safeguards as box sets. A run where any TheTVDB lookup fails removes nothing.
+
+Each franchise collection's description ends with `Source: TheTVDB.com (<link to the list>)`. That's the attribution TheTVDB's free API tier requires, shown next to the data viewers see, so leave it in place.
+
+The plugin owns collections with the slug `tvdb-list-<id>` and the group with the slug `franchises`.
+
+### Get a TheTVDB key
+
+Every server uses its own key; the plugin doesn't ship one.
+
+1. Sign up on [TheTVDB's API page](https://thetvdb.com/api-information).
+2. Choose the free tier (projects under $50k a year, attribution required). Name the project after your server, for example "Silo Box Set Collections on my home server", and describe it as a plugin that groups the series in your own library into franchise collections.
+3. Paste the key under the plugin's **Settings** as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
+4. Press **Run now** under **Admin → Scheduled Tasks**.
+
+Whether a franchise appears depends on TheTVDB marking its list official. If one you expect is missing, check its page on thetvdb.com.
 
 ## When it runs
 

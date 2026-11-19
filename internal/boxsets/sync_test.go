@@ -26,6 +26,9 @@ func (h *fakeHost) BaseURL(context.Context) (string, error) { return "http://sil
 func (h *fakeHost) MovieLibraries(context.Context) ([]Library, error) {
 	return []Library{{ID: "lib", Name: "Movies"}}, nil
 }
+func (h *fakeHost) SeriesLibraries(context.Context) ([]Library, error) {
+	return []Library{{ID: "tvlib", Name: "Series"}}, nil
+}
 func (h *fakeHost) ReadState(_ context.Context, k string) ([]byte, bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -43,6 +46,8 @@ func (h *fakeHost) WriteState(_ context.Context, k string, v []byte) error {
 // with fewer than two movies answer 404 as Silo does.
 type fakeAPI struct {
 	movieBoxSet map[string]string // movie -> box set ("" for none)
+	series      []silo.SeriesRef
+	seriesErr   error
 	boxSets     map[string]silo.BoxSet
 	collections map[string]*silo.Collection
 	members     map[string][]string
@@ -77,6 +82,9 @@ func (f *fakeAPI) Movies(context.Context, string) ([]string, error) {
 	}
 	slices.Sort(out)
 	return out, nil
+}
+func (f *fakeAPI) Series(context.Context, string) ([]silo.SeriesRef, error) {
+	return slices.Clone(f.series), f.seriesErr
 }
 func (f *fakeAPI) ItemBoxSet(ctx context.Context, cid, lib string) (*silo.BoxSet, error) {
 	f.lookups = append(f.lookups, cid)
@@ -367,10 +375,10 @@ func TestCacheRoundTripsAcrossChunks(t *testing.T) {
 	for i := range cacheChunk*2 + 7 {
 		m[fmt.Sprintf("m%05d", i)] = fmt.Sprint(i % 3)
 	}
-	if err := s.saveCache(ctx, "lib", m); err != nil {
+	if err := s.saveCache(ctx, movieCache, "lib", m); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.loadCache(ctx, "lib")
+	got, err := s.loadCache(ctx, movieCache, "lib")
 	if err != nil || len(got) != len(m) || got["m00004"] != "1" {
 		t.Fatalf("got %d entries, err %v", len(got), err)
 	}

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/neilmc78/silo-plugin-boxset-collections/internal/silo"
+	"github.com/neilmc78/silo-plugin-boxset-collections/internal/tvdb"
 )
 
 // Silo events that can change which movies a library has or which box set a
@@ -60,6 +61,8 @@ type Host interface {
 	BaseURL(ctx context.Context) (string, error)
 	// MovieLibraries lists libraries that can hold movies.
 	MovieLibraries(ctx context.Context) ([]Library, error)
+	// SeriesLibraries lists libraries that can hold series.
+	SeriesLibraries(ctx context.Context) ([]Library, error)
 	ReadState(ctx context.Context, key string) ([]byte, bool, error)
 	WriteState(ctx context.Context, key string, value []byte) error
 }
@@ -69,6 +72,7 @@ type API interface {
 	PrimaryProfile(ctx context.Context) (silo.Profile, error)
 	UseProfile(id string)
 	Movies(ctx context.Context, libraryID string) ([]string, error)
+	Series(ctx context.Context, libraryID string) ([]silo.SeriesRef, error)
 	ItemBoxSet(ctx context.Context, contentID, libraryID string) (*silo.BoxSet, error)
 	BoxSet(ctx context.Context, id, libraryID string) (silo.BoxSet, error)
 	Collections(ctx context.Context, libraryID string) ([]silo.Collection, error)
@@ -95,6 +99,12 @@ type Syncer struct {
 	log    *slog.Logger
 	host   Host
 	newAPI func(baseURL, apiKey string) API
+	// newTVDB builds the TheTVDB client for a key and PIN.
+	newTVDB func(apiKey, pin string) TVDB
+	// tvdb is kept across syncs so its login token is reused.
+	tvdb    TVDB
+	tvdbFor string
+	now     func() time.Time
 
 	mu  sync.Mutex
 	cfg Config
@@ -118,7 +128,10 @@ func New(log *slog.Logger, host Host, newAPI func(baseURL, apiKey string) API) *
 	if newAPI == nil {
 		newAPI = func(baseURL, apiKey string) API { return silo.New(baseURL, apiKey) }
 	}
-	return &Syncer{log: log, host: host, newAPI: newAPI, stale: map[string]bool{}}
+	return &Syncer{
+		log: log, host: host, newAPI: newAPI, stale: map[string]bool{}, now: time.Now,
+		newTVDB: func(apiKey, pin string) TVDB { return tvdb.New("", apiKey, pin) },
+	}
 }
 
 // Configure stores the settings the host sends.
@@ -268,10 +281,15 @@ type Report struct {
 	Libraries int
 	Looked    int
 	BoxSets   int
-	Created   int
-	Updated   int
-	Removed   int
-	Errors    []string
+	// The series counts stay zero while no TheTVDB key is set.
+	SeriesLibraries   int
+	SeriesLooked      int
+	Franchises        int
+	SeriesWithoutTVDB int
+	Created           int
+	Updated           int
+	Removed           int
+	Errors            []string
 }
 
 // Map is the report as a scheduled task's output.
@@ -284,7 +302,9 @@ func (r Report) Map() map[string]any {
 	}
 	return map[string]any{
 		"libraries": r.Libraries, "movies_looked_up": r.Looked, "box_sets": r.BoxSets,
-		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
+		"series_libraries": r.SeriesLibraries, "series_looked_up": r.SeriesLooked, "franchises": r.Franchises,
+		"series_without_tvdb_id": r.SeriesWithoutTVDB,
+		"created":                r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
 	}
 }
 
@@ -338,7 +358,18 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		}
 		report.Libraries++
 	}
+	if cfg.TVDBAPIKey != "" {
+		if err := s.syncSeries(ctx, api, cfg, full, stale, &report); err != nil {
+			s.pending.Lock()
+			for id := range stale {
+				s.stale[id] = true
+			}
+			s.pending.Unlock()
+			return report, err
+		}
+	}
 	s.log.Info("box set collections: synced", "libraries", report.Libraries, "box_sets", report.BoxSets,
+		"series_libraries", report.SeriesLibraries, "franchises", report.Franchises,
 		"created", report.Created, "updated", report.Updated, "removed", report.Removed, "looked_up", report.Looked)
 	if len(report.Errors) > 0 {
 		// A library that failed may not have looked its refreshed movies up;
@@ -349,7 +380,7 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		}
 		s.pending.Unlock()
 	}
-	if len(report.Errors) > 0 && report.Libraries == 0 {
+	if len(report.Errors) > 0 && report.Libraries+report.SeriesLibraries == 0 {
 		return report, errors.New(strings.Join(report.Errors, "; "))
 	}
 	return report, nil
@@ -368,7 +399,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	// Which box set each movie is in. A lookup answers with the whole box
 	// set and its movies, so its siblings need no lookup of their own, and
 	// the box sets found this way need no second read.
-	cache, err := s.loadCache(ctx, lib.ID)
+	cache, err := s.loadCache(ctx, movieCache, lib.ID)
 	if err != nil {
 		return err
 	}
@@ -404,7 +435,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			// Keep progress, so a sync stopped part way resumes from here.
 			partial := maps.Clone(cache)
 			maps.Copy(partial, next)
-			if err := s.saveCache(ctx, lib.ID, partial); err != nil {
+			if err := s.saveCache(ctx, movieCache, lib.ID, partial); err != nil {
 				return err
 			}
 		}
@@ -422,7 +453,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			found[b.ID] = *b
 		}
 	}
-	if err := s.saveCache(ctx, lib.ID, next); err != nil {
+	if err := s.saveCache(ctx, movieCache, lib.ID, next); err != nil {
 		return err
 	}
 
@@ -456,21 +487,60 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	}
 	report.BoxSets += len(want)
 
+	confirmGone := func(id string) (bool, error) {
+		// Not finding a box set is not proof it is gone: only Silo saying
+		// so for this box set (404) removes its collection.
+		b, err := api.BoxSet(ctx, id, lib.ID)
+		switch {
+		case errors.Is(err, silo.ErrNotFound):
+			return true, nil
+		case err != nil:
+			return false, fmt.Errorf("could not confirm its box set is gone: %w", err)
+		case len(b.Members) > 0:
+			return false, errors.New("its box set still forms, though no movie lookup found it")
+		default:
+			return false, nil
+		}
+	}
+	return s.apply(ctx, api, lib, movieKind(cfg), want, unreadable, failed, confirmGone, report)
+}
+
+// collectionKind is one family of collections the plugin owns: its slug
+// prefix, its group, and what the report calls one.
+type collectionKind struct {
+	slugPrefix string
+	groupSlug  string
+	groupName  string
+	noun       string
+}
+
+func movieKind(cfg Config) collectionKind {
+	return collectionKind{slugPrefix: collectionSlugPrefix, groupSlug: groupSlug, groupName: cfg.GroupName, noun: "box set"}
+}
+
+// apply brings a library's collections of one kind in line with want,
+// keyed by the ID after the slug prefix. unreadable names IDs whose state is
+// unknown, so their collections are kept; failed counts lookups that failed
+// this run, which holds back every removal. confirmGone is asked before each
+// removal and keeps the collection unless it answers true; its error says
+// why one was kept.
+func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectionKind, want map[string]silo.BoxSet,
+	unreadable map[string]bool, failed int, confirmGone func(id string) (bool, error), report *Report) error {
 	collections, err := api.Collections(ctx, lib.ID)
 	if err != nil {
 		return fmt.Errorf("listing collections: %w", err)
 	}
 	have := map[string]silo.Collection{}
 	for _, c := range collections {
-		if id, ok := strings.CutPrefix(c.Slug, collectionSlugPrefix); ok && id != "" {
+		if id, ok := strings.CutPrefix(c.Slug, kind.slugPrefix); ok && id != "" {
 			have[id] = c
 		}
 	}
 
-	// Collections whose box set no longer forms go, but only when this run
-	// knows every movie's box set: a failed lookup (Silo throttling the key,
-	// say) leaves box sets unknown, not gone. A run that would remove most
-	// of the library's box set collections is refused too, so no bug or
+	// Collections whose source no longer qualifies go, but only when this
+	// run knows every item's state: a failed lookup (a throttled key, say)
+	// leaves sources unknown, not gone. A run that would remove most of the
+	// library's collections of this kind is refused too, so no bug or
 	// outage can wipe them. One removal that fails (Silo answers 409 while a
 	// Home row still shows it) is reported and the rest carry on.
 	var remove []silo.Collection
@@ -485,18 +555,14 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		report.addError(lib, "removals skipped: %d lookups failed, so %d collections were kept until a run completes", failed, len(remove))
 		remove = nil
 	case len(remove) > massRemovalFloor && len(remove)*2 > len(have):
-		report.addError(lib, "removals skipped: %d of %d box set collections would go, more than half; if that is intended, delete them by hand", len(remove), len(have))
+		report.addError(lib, "removals skipped: %d of %d %s collections would go, more than half; if that is intended, delete them by hand", len(remove), len(have), kind.noun)
 		remove = nil
 	}
 	for _, c := range remove {
-		// Not finding a box set is not proof it is gone: only Silo saying
-		// so for this box set (404) removes its collection.
-		id := strings.TrimPrefix(c.Slug, collectionSlugPrefix)
-		if b, err := api.BoxSet(ctx, id, lib.ID); !errors.Is(err, silo.ErrNotFound) {
-			if err != nil {
-				report.addError(lib, "kept %q: could not confirm its box set is gone: %v", c.Title, err)
-			} else if len(b.Members) > 0 {
-				report.addError(lib, "kept %q: its box set still forms, though no movie lookup found it", c.Title)
+		gone, why := confirmGone(strings.TrimPrefix(c.Slug, kind.slugPrefix))
+		if !gone {
+			if why != nil {
+				report.addError(lib, "kept %q: %v", c.Title, why)
 			}
 			continue
 		}
@@ -511,7 +577,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		return nil
 	}
 
-	groupID, err := ensureGroup(ctx, api, lib.ID, cfg.GroupName)
+	groupID, err := ensureGroup(ctx, api, lib.ID, kind.groupName, kind.groupSlug)
 	if err != nil {
 		return err
 	}
@@ -524,7 +590,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 		if !exists {
 			c, err = api.CreateCollection(ctx, silo.NewCollection{
 				LibraryID: lib.ID, Title: b.Title, Description: b.Overview,
-				Slug: collectionSlugPrefix + id, GroupID: groupID,
+				Slug: kind.slugPrefix + id, GroupID: groupID,
 			})
 			if err != nil {
 				report.addError(lib, "creating %q: %v", b.Title, err)
@@ -706,13 +772,13 @@ func isTMDBImage(address string) bool {
 	return strings.HasPrefix(address, "https://image.tmdb.org/") || strings.HasPrefix(address, "http://image.tmdb.org/")
 }
 
-func ensureGroup(ctx context.Context, api API, libraryID, name string) (string, error) {
+func ensureGroup(ctx context.Context, api API, libraryID, name, slug string) (string, error) {
 	groups, err := api.Groups(ctx, libraryID)
 	if err != nil {
 		return "", fmt.Errorf("listing collection groups: %w", err)
 	}
 	for _, g := range groups {
-		if g.Slug == groupSlug {
+		if g.Slug == slug {
 			return g.ID, nil
 		}
 	}
@@ -721,7 +787,7 @@ func ensureGroup(ctx context.Context, api API, libraryID, name string) (string, 
 			return g.ID, nil
 		}
 	}
-	g, err := api.CreateGroup(ctx, libraryID, name, groupSlug)
+	g, err := api.CreateGroup(ctx, libraryID, name, slug)
 	if err != nil {
 		return "", fmt.Errorf("creating the %q group: %w", name, err)
 	}
@@ -759,12 +825,21 @@ const cacheChunk = 2500
 // a sync.
 const cacheSaveEvery = 200
 
-func cacheKey(libraryID string, n int) string { return fmt.Sprintf("cache:%s:%d", libraryID, n) }
-func cacheCountKey(libraryID string) string   { return "cache:" + libraryID + ":chunks" }
+// Caches are named by a prefix: movieCache for box sets, seriesCache for
+// TheTVDB lists.
+const (
+	movieCache  = "cache"
+	seriesCache = "tvdb"
+)
 
-func (s *Syncer) loadCache(ctx context.Context, libraryID string) (map[string]string, error) {
+func cacheKey(prefix, libraryID string, n int) string {
+	return fmt.Sprintf("%s:%s:%d", prefix, libraryID, n)
+}
+func cacheCountKey(prefix, libraryID string) string { return prefix + ":" + libraryID + ":chunks" }
+
+func (s *Syncer) loadCache(ctx context.Context, prefix, libraryID string) (map[string]string, error) {
 	out := map[string]string{}
-	raw, ok, err := s.host.ReadState(ctx, cacheCountKey(libraryID))
+	raw, ok, err := s.host.ReadState(ctx, cacheCountKey(prefix, libraryID))
 	if err != nil || !ok {
 		return out, err
 	}
@@ -773,7 +848,7 @@ func (s *Syncer) loadCache(ctx context.Context, libraryID string) (map[string]st
 		return out, nil
 	}
 	for i := 0; i < chunks; i++ {
-		raw, ok, err := s.host.ReadState(ctx, cacheKey(libraryID, i))
+		raw, ok, err := s.host.ReadState(ctx, cacheKey(prefix, libraryID, i))
 		if err != nil {
 			return nil, err
 		}
@@ -790,7 +865,7 @@ func (s *Syncer) loadCache(ctx context.Context, libraryID string) (map[string]st
 	return out, nil
 }
 
-func (s *Syncer) saveCache(ctx context.Context, libraryID string, m map[string]string) error {
+func (s *Syncer) saveCache(ctx context.Context, prefix, libraryID string, m map[string]string) error {
 	ids := make([]string, 0, len(m))
 	for id := range m {
 		ids = append(ids, id)
@@ -806,11 +881,11 @@ func (s *Syncer) saveCache(ctx context.Context, libraryID string, m map[string]s
 		if err != nil {
 			return err
 		}
-		if err := s.host.WriteState(ctx, cacheKey(libraryID, chunks), raw); err != nil {
+		if err := s.host.WriteState(ctx, cacheKey(prefix, libraryID, chunks), raw); err != nil {
 			return fmt.Errorf("saving the cache: %w", err)
 		}
 		chunks++
 	}
 	raw, _ := json.Marshal(chunks)
-	return s.host.WriteState(ctx, cacheCountKey(libraryID), raw)
+	return s.host.WriteState(ctx, cacheCountKey(prefix, libraryID), raw)
 }
