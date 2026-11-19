@@ -545,6 +545,9 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		// The sync's context may be spent; what it learned still counts.
 		sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
+		if err := s.saveExclusions(sctx, st.excluding, st.excludingBoxSets); err != nil {
+			report.Errors = append(report.Errors, "adding deleted collections to the excluded settings: "+err.Error())
+		}
 		if err := s.saveState(sctx, st); err != nil {
 			report.Errors = append(report.Errors, err.Error())
 			s.log.Warn("box set collections: could not save state", "error", err)
@@ -580,13 +583,7 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		report.Libraries++
 	}
 	if cfg.SeriesEnabled() {
-		err := s.syncSeries(ctx, api, cfg, full, stale, &report)
-		if len(st.excluding) > 0 {
-			if xerr := s.excludeLists(cfg, st.excluding); xerr != nil {
-				report.Errors = append(report.Errors, "adding deleted franchises to the excluded lists: "+xerr.Error())
-			}
-		}
-		if err != nil {
+		if err := s.syncSeries(ctx, api, cfg, full, stale, &report); err != nil {
 			s.pending.Lock()
 			for id := range stale {
 				s.stale[id] = true
@@ -729,7 +726,7 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 			return false, nil
 		}
 	}
-	return s.apply(ctx, api, lib, movieKind(cfg), want, unreadable, failed, confirmGone, report)
+	return s.apply(ctx, api, lib, s.movieKind(cfg), want, unreadable, failed, confirmGone, report)
 }
 
 // collectionKind is one family of collections the plugin owns: its slug
@@ -748,8 +745,18 @@ type collectionKind struct {
 	excludeOnDelete func(id string)
 }
 
-func movieKind(cfg Config) collectionKind {
-	return collectionKind{slugPrefix: collectionSlugPrefix, groupSlug: groupSlug, groupName: cfg.GroupName, noun: "box set"}
+func (s *Syncer) movieKind(cfg Config) collectionKind {
+	return collectionKind{
+		slugPrefix: collectionSlugPrefix, groupSlug: groupSlug, groupName: cfg.GroupName, noun: "box set",
+		excluded: func(id string) bool {
+			return cfg.ExcludedBoxSet(id) || (s.state != nil && s.state.excludingBoxSets[id])
+		},
+		excludeOnDelete: func(id string) {
+			if s.state != nil {
+				s.state.excludingBoxSets[id] = true
+			}
+		},
+	}
 }
 
 // apply brings a library's collections of one kind in line with want,
@@ -874,26 +881,38 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 	return nil
 }
 
-// excludeLists adds TheTVDB lists to the excluded lists setting, keeping
-// every other setting as Silo sent it, and updates the plugin's copy.
-func (s *Syncer) excludeLists(cfg Config, ids map[string]bool) error {
-	all := slices.Clone(cfg.ExcludedLists)
-	for id := range ids {
-		all = append(all, id)
+// saveExclusions adds TheTVDB lists and box sets whose collections the
+// admin deleted to the excluded settings, in one write that keeps every
+// other setting as the plugin last received it, and updates the plugin's
+// copy.
+func (s *Syncer) saveExclusions(ctx context.Context, lists, boxSets map[string]bool) error {
+	if len(lists) == 0 && len(boxSets) == 0 {
+		return nil
 	}
-	all = ParseListIDs(strings.Join(all, ","))
+	cfg := s.config()
+	merge := func(have []string, add map[string]bool) []string {
+		all := slices.Clone(have)
+		for id := range add {
+			all = append(all, id)
+		}
+		return ParseListIDs(strings.Join(all, ","))
+	}
+	excludedLists, excludedBoxSets := merge(cfg.ExcludedLists, lists), merge(cfg.ExcludedBoxSets, boxSets)
 	values := maps.Clone(cfg.Raw)
 	if values == nil {
 		values = map[string]any{}
 	}
-	values[fieldExcludedLists] = strings.Join(all, ", ")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	if len(lists) > 0 {
+		values[fieldExcludedLists] = strings.Join(excludedLists, ", ")
+	}
+	if len(boxSets) > 0 {
+		values[fieldExcludedBoxSets] = strings.Join(excludedBoxSets, ", ")
+	}
 	if err := s.host.SaveSettings(ctx, values); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	s.cfg.ExcludedLists, s.cfg.Raw = all, values
+	s.cfg.ExcludedLists, s.cfg.ExcludedBoxSets, s.cfg.Raw = excludedLists, excludedBoxSets, values
 	s.mu.Unlock()
 	return nil
 }
@@ -918,6 +937,12 @@ func (s *Syncer) noteDeletions(lib Library, kind collectionKind, have map[string
 			continue
 		}
 		if value == deletedMark {
+			if kind.excludeOnDelete != nil {
+				// A deletion 1.1.4 kept out of sight moves into the
+				// setting, where the admin can see and undo it.
+				kind.excludeOnDelete(id)
+				s.state.drop(ownedMap, s.state.owned, key)
+			}
 			if b, ok := want[id]; ok {
 				report.Skipped = append(report.Skipped, fmt.Sprintf("%s (%s, you deleted it)", b.Title, id))
 				delete(want, id)

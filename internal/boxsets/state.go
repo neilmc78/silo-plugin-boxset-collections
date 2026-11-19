@@ -26,8 +26,8 @@ const (
 	artworkMap = "artwork"
 	listsMap   = "tvdblists"
 	ownedMap   = "owned"
-	// deletedMark records a box set collection its admin deleted, so it is
-	// not made again.
+	// deletedMark is how 1.1.4 recorded a box set collection its admin
+	// deleted. 1.1.5 moves each into the excluded box sets setting.
 	deletedMark = "deleted"
 )
 
@@ -132,6 +132,9 @@ type syncState struct {
 	// excluding are TheTVDB lists whose franchise collections the admin
 	// deleted this sync, to add to the excluded lists setting.
 	excluding map[string]bool
+	// excludingBoxSets are box sets whose collections the admin deleted,
+	// to add to the excluded box sets setting.
+	excludingBoxSets map[string]bool
 	// artFailures are images the sync could not set.
 	artFailures []string
 }
@@ -153,7 +156,7 @@ func (st *syncState) drop(name string, m map[string]string, key string) {
 }
 
 func (s *Syncer) loadState(ctx context.Context) (*syncState, error) {
-	st := &syncState{dirty: map[string]bool{}, excluding: map[string]bool{}}
+	st := &syncState{dirty: map[string]bool{}, excluding: map[string]bool{}, excludingBoxSets: map[string]bool{}}
 	var err error
 	if st.artwork, err = s.loadMap(ctx, artworkMap); err != nil {
 		return nil, err
