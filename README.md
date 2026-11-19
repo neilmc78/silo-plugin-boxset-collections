@@ -26,7 +26,7 @@ If you ran a Silo build with box set collections built in, those collections use
 
 ## TV franchises
 
-TV franchises are off until you set a TheTVDB API key. With a key, on each run, for every series library (and mixed library):
+TV franchises need the **TV franchises** switch on (it is by default) and a TheTVDB API key, both in the plugin's settings. Series libraries need no setting of their own in Silo: unlike movie box sets, which Silo builds and the plugin reads, franchises come straight from TheTVDB. With a key, on each run, for every series library (and mixed library):
 
 1. Reads each series' TheTVDB ID from Silo. Series Silo has no TheTVDB ID for are skipped and counted in the task's output (`series_without_tvdb_id`).
 2. Asks TheTVDB which **official** lists each series is on. Lists anyone can make, such as "My favourites", are ignored. Answers are cached: quick runs only look up new or refreshed series, and full runs look a series up again after a week.
@@ -43,7 +43,7 @@ Every server uses its own key; the plugin doesn't ship one.
 
 1. Sign up on [TheTVDB's API page](https://thetvdb.com/api-information).
 2. Choose the free tier (projects under $50k a year, attribution required). Name the project after your server, for example "Silo Box Set Collections on my home server", and describe it as a plugin that groups the series in your own library into franchise collections.
-3. Paste the key under the plugin's **Settings** as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
+3. In the plugin's **Settings**, leave **TV franchises** on and paste the key in the **TheTVDB** section as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
 4. Press **Run now** under **Admin → Scheduled Tasks**.
 
 Whether a franchise appears depends on TheTVDB marking its list official. If one you expect is missing, check its page on thetvdb.com.
@@ -54,7 +54,7 @@ Whether a franchise appears depends on TheTVDB marking its list official. If one
 
   Silo gives a plugin task 10 seconds to answer, so the task starts the sync in the background and answers straight away. Collections appear over the next minute or two.
 
-  Silo doesn't show a plugin task's output, so when the previous sync hit a problem, the next run is marked **failed** and its **Error** column says what happened. For example: `last sync: …; 1 series libraries, 212 series looked up, 0 official lists (38 unofficial, 0 too small), 0 franchises. TheTVDB has no official list for any of your series`. The new sync still starts. With a TheTVDB key set, a sync that forms no franchise counts as a problem too, and the message names the closest lists: for example `Closest: Yellowstone Franchise (7502) matched 1 of your series (list has 6 series; needs 2)`. A run after a clean sync shows as completed. The full summary also goes to the container log (`docker logs`), on lines starting `box set collections:`.
+  Silo doesn't show a plugin task's output, so when the previous sync hit a problem, the next run is marked **failed** and its **Error** column says what happened. For example: `last sync: …; 1 series libraries, 212 series looked up, 0 official lists (38 unofficial, 0 too small), 0 franchises. TheTVDB has no official list for any of your series`. The new sync still starts. With a TheTVDB key set, a sync that forms no franchise counts as a problem too, and the message names the closest lists: for example `Closest: Yellowstone Franchise (7502) matched 1 of your series (list has 6 series; needs 2)`. A run after a clean sync shows as completed. The plugin's page in **Admin → Plugins** also has a **Last sync** box. The plugin writes there when each sync starts and when it finishes, with the full report: movie and series counts, the closest TheTVDB lists that didn't become franchises, and any problems. Reload the page to see the latest. The full summary also goes to the container log (`docker logs`), on lines starting `box set collections:`.
 - **After library changes.** About 20 seconds after a library scan or a metadata refresh, a quick run checks new and refreshed movies. A burst of events gives one run.
 
 ## Before you start

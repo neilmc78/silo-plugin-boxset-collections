@@ -296,3 +296,70 @@ func TestRunStaysQuietWithoutATVDBKey(t *testing.T) {
 		t.Fatalf("Run without a TheTVDB key: %v", err)
 	}
 }
+
+func TestSyncWritesItsReportToThePluginPage(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	host := s.host.(*fakeHost)
+	s.Version = "1.1.3"
+	api.series = []silo.SeriesRef{{ContentID: "s3", TvdbID: "300"}, {ContentID: "s9"}}
+	s.syncAndRecord(context.Background(), true)
+	if len(host.status) != 2 {
+		t.Fatalf("status writes = %d, want started then finished", len(host.status))
+	}
+	if !strings.HasPrefix(host.status[0], "Sync started") || !strings.Contains(host.status[0], "TheTVDB key: present") {
+		t.Fatalf("start status = %q", host.status[0])
+	}
+	done := host.status[1]
+	for _, want := range []string{
+		"plugin v1.1.3",
+		"series without a TheTVDB ID in Silo: 1",
+		"franchises: 0",
+		"- Yellowstone (7) matched 1 of your series (list has 4 series; needs 2)",
+	} {
+		if !strings.Contains(done, want) {
+			t.Fatalf("finished status lacks %q:\n%s", want, done)
+		}
+	}
+}
+
+func TestStatusSaysWhenTheTVDBKeyIsMissing(t *testing.T) {
+	s, _, _ := setup(t)
+	host := s.host.(*fakeHost)
+	s.syncAndRecord(context.Background(), true)
+	if got := host.status[len(host.status)-1]; !strings.Contains(got, "skipped, because the settings the plugin received have no TheTVDB API key") {
+		t.Fatalf("status = %q", got)
+	}
+}
+
+func TestTVFranchisesSwitchOffSkipsSeries(t *testing.T) {
+	s, api, tv := setupSeries(t)
+	host := s.host.(*fakeHost)
+	value, _ := structpb.NewStruct(map[string]any{"api_key": "k", "tvdb_api_key": "tv", "tv_franchises": false})
+	if err := s.Configure(context.Background(), []*pluginv1.ConfigEntry{{Key: "settings", Value: value}}); err != nil {
+		t.Fatal(err)
+	}
+	s.syncAndRecord(context.Background(), true)
+	if len(tv.lookups) != 0 || api.bySlug("tvdb-list-7") != nil {
+		t.Fatalf("series synced with the switch off: lookups %v", tv.lookups)
+	}
+	if got := host.status[len(host.status)-1]; !strings.Contains(got, "TV franchises: off in the plugin's settings") {
+		t.Fatalf("status = %q", got)
+	}
+}
+
+func TestParseConfigReadsTheTVFranchisesSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		value any
+		want  bool
+	}{{nil, true}, {false, false}, {true, true}, {"false", false}} {
+		fields := map[string]any{}
+		if tc.value != nil {
+			fields["tv_franchises"] = tc.value
+		}
+		value, _ := structpb.NewStruct(fields)
+		cfg, err := ParseConfig([]*pluginv1.ConfigEntry{{Key: "settings", Value: value}})
+		if err != nil || cfg.TVFranchises != tc.want {
+			t.Fatalf("tv_franchises %v: got %v, %v; want %v", tc.value, cfg.TVFranchises, err, tc.want)
+		}
+	}
+}

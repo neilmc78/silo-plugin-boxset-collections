@@ -283,7 +283,7 @@ func nearMissOf(l tvdb.List, byTVDB map[string]string, minShows int) NearMiss {
 }
 
 // maxNearMisses is how many near misses a report keeps: the closest ones.
-const maxNearMisses = 3
+const maxNearMisses = 10
 
 func (r *Report) addNearMiss(n NearMiss) {
 	r.NearMisses = append(r.NearMisses, n)

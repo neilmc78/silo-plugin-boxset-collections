@@ -18,8 +18,16 @@ import (
 )
 
 type fakeHost struct {
-	mu    sync.Mutex
-	state map[string][]byte
+	mu     sync.Mutex
+	state  map[string][]byte
+	status []string
+}
+
+func (h *fakeHost) SetStatus(_ context.Context, report string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.status = append(h.status, report)
+	return nil
 }
 
 func (h *fakeHost) BaseURL(context.Context) (string, error) { return "http://silo", nil }
