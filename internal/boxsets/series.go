@@ -200,6 +200,7 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 			want[id] = b
 		} else {
 			tooSmall++
+			report.addNearMiss(nearMissOf(r.list, byTVDB, cfg.SeriesMinShows))
 		}
 	}
 	report.Franchises += len(want)
@@ -249,6 +250,47 @@ func franchiseOf(l tvdb.List, byTVDB map[string]string, minShows int) (silo.BoxS
 		ID: l.ID, Title: l.Name, Overview: attributed(l.Overview, l.PageURL()),
 		PosterURL: artworkURL(l.Image), Members: members,
 	}, true
+}
+
+// NearMiss is a list read for a library that did not become a franchise,
+// with why: how many of the library's series it matched against how many
+// it needed, and how many series the list has at all.
+type NearMiss struct {
+	ListID   string
+	Name     string
+	Matched  int
+	Series   int
+	Needed   int
+	Official bool
+}
+
+func (n NearMiss) String() string {
+	s := fmt.Sprintf("%s (%s) matched %d of your series (list has %d series; needs %d)", n.Name, n.ListID, n.Matched, n.Series, n.Needed)
+	if !n.Official {
+		s += ", and TheTVDB says the list is not official"
+	}
+	return s
+}
+
+func nearMissOf(l tvdb.List, byTVDB map[string]string, minShows int) NearMiss {
+	matched := 0
+	for _, id := range l.SeriesIDs {
+		if _, ok := byTVDB[id]; ok {
+			matched++
+		}
+	}
+	return NearMiss{ListID: l.ID, Name: l.Name, Matched: matched, Series: len(l.SeriesIDs), Needed: max(minShows, 2), Official: l.Official}
+}
+
+// maxNearMisses is how many near misses a report keeps: the closest ones.
+const maxNearMisses = 3
+
+func (r *Report) addNearMiss(n NearMiss) {
+	r.NearMisses = append(r.NearMisses, n)
+	sort.SliceStable(r.NearMisses, func(i, j int) bool { return r.NearMisses[i].Matched > r.NearMisses[j].Matched })
+	if len(r.NearMisses) > maxNearMisses {
+		r.NearMisses = r.NearMisses[:maxNearMisses]
+	}
 }
 
 // attributed adds the credit and link TheTVDB's free API tier requires to

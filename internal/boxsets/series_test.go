@@ -245,3 +245,54 @@ func TestSyncRenamesTheGroupToTheSetting(t *testing.T) {
 		t.Fatalf("franchise groups = %v, want the one group renamed to Universes", names)
 	}
 }
+
+// runTwice records a sync's report and returns the error the next Run
+// reports for it.
+func runTwice(t *testing.T, s *Syncer) error {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{}); err != nil {
+		s.wg.Wait()
+		t.Fatalf("first Run, with no report yet: %v", err)
+	}
+	s.wg.Wait()
+	_, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{})
+	s.wg.Wait()
+	return err
+}
+
+func TestRunNamesTheClosestListWhenNoFranchiseForms(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	// The library keeps only one of the Yellowstone list's series.
+	api.series = []silo.SeriesRef{{ContentID: "s3", TvdbID: "300"}}
+	err := runTwice(t, s)
+	if err == nil {
+		t.Fatal("Run hid a sync where no official list had enough series")
+	}
+	for _, want := range []string{"Closest: Yellowstone (7) matched 1 of your series (list has 4 series; needs 2)", "0 franchises"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q lacks %q", err, want)
+		}
+	}
+}
+
+func TestRunSaysWhenAListHasNoSeries(t *testing.T) {
+	s, _, tv := setupSeries(t)
+	// TheTVDB answers with the list but no series entities in it.
+	for id, l := range tv.lists {
+		l.SeriesIDs = nil
+		tv.lists[id] = l
+	}
+	err := runTwice(t, s)
+	if err == nil || !strings.Contains(err.Error(), "matched 0 of your series (list has 0 series") {
+		t.Fatalf("err = %v, want the empty list named", err)
+	}
+}
+
+func TestRunStaysQuietWithoutATVDBKey(t *testing.T) {
+	s, api, _ := setup(t)
+	api.series = []silo.SeriesRef{{ContentID: "s1", TvdbID: "100"}}
+	if err := runTwice(t, s); err != nil {
+		t.Fatalf("Run without a TheTVDB key: %v", err)
+	}
+}
