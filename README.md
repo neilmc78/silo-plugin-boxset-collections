@@ -53,13 +53,13 @@ Whether a franchise appears depends on TheTVDB marking its list official. If one
 A collection you delete stays deleted:
 
 - **A TV franchise:** its TheTVDB list ID is added to **Excluded TheTVDB lists** in the plugin's settings. Remove the ID there to bring the collection back on the next sync. You can also add IDs yourself (the number in a list's thetvdb.com address, or shown beside it in the Last sync box) to skip a list before it is ever made.
-- **A movie box set:** the plugin remembers the deletion and doesn't make it again.
+- **A movie box set:** its TMDB collection ID is added to **Excluded box sets** in the plugin's settings (Box set options). Remove the ID there to bring it back; you can also add IDs yourself (the number in a collection's themoviedb.org address, or shown beside it in the Last sync box).
 
 To keep a collection but hide it from viewers, hide it instead: the plugin never changes a collection's visibility.
 
 If many of a library's collections vanish at once, the plugin assumes something went wrong rather than that you deleted them all, and records nothing that sync.
 
-## Upgrading to 1.1.4
+## Upgrading to 1.1.4 or later
 
 Versions before 1.1.4 used one storage key per collection, and Silo allows a plugin 256 keys with no way to delete one. If the Last sync box says the plugin's storage is full, uninstall and reinstall the plugin once to clear it, then enter the API keys again. Your collections stay; the plugin picks them back up. From 1.1.4 the plugin uses a few dozen keys at most, however large the library.
 

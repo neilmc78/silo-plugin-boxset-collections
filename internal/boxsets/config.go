@@ -2,6 +2,7 @@ package boxsets
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ const (
 	fieldTVFranchises    = "tv_franchises"
 	fieldMovieBoxSets    = "movie_box_sets"
 	fieldExcludedLists   = "excluded_tvdb_lists"
+	fieldExcludedBoxSets = "excluded_box_sets"
 
 	defaultGroupName       = "Box Sets"
 	defaultSeriesGroupName = "Franchises"
@@ -50,6 +52,9 @@ type Config struct {
 	// ExcludedLists are TheTVDB list IDs never made into collections: the
 	// admin's own, and those of franchise collections the admin deleted.
 	ExcludedLists []string
+	// ExcludedBoxSets are TMDB collection IDs never made into box set
+	// collections, the same way.
+	ExcludedBoxSets []string
 	// Raw is the settings entry as Silo sent it, so the plugin can write the
 	// excluded lists back without losing the other values.
 	Raw map[string]any
@@ -85,12 +90,16 @@ func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
 			}
 			*dst = on
 		}
-		if raw, ok := values[fieldExcludedLists]; ok && raw != nil {
+		for field, dst := range map[string]*[]string{fieldExcludedLists: &cfg.ExcludedLists, fieldExcludedBoxSets: &cfg.ExcludedBoxSets} {
+			raw, ok := values[field]
+			if !ok || raw == nil {
+				continue
+			}
 			s, ok := raw.(string)
 			if !ok {
-				return Config{}, fmt.Errorf("%s.%s must be text", configKey, fieldExcludedLists)
+				return Config{}, fmt.Errorf("%s.%s must be text", configKey, field)
 			}
-			cfg.ExcludedLists = ParseListIDs(s)
+			*dst = ParseListIDs(s)
 		}
 		if raw, ok := values[fieldSeriesMinShows]; ok && raw != nil {
 			n, err := minShows(raw)
@@ -187,11 +196,7 @@ func ParseListIDs(s string) []string {
 }
 
 // Excluded reports whether a TheTVDB list is excluded.
-func (c Config) Excluded(listID string) bool {
-	for _, id := range c.ExcludedLists {
-		if id == listID {
-			return true
-		}
-	}
-	return false
-}
+func (c Config) Excluded(listID string) bool { return slices.Contains(c.ExcludedLists, listID) }
+
+// ExcludedBoxSet reports whether a box set (TMDB collection) is excluded.
+func (c Config) ExcludedBoxSet(id string) bool { return slices.Contains(c.ExcludedBoxSets, id) }

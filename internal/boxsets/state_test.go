@@ -145,19 +145,25 @@ func TestExcludingAListRemovesItsCollection(t *testing.T) {
 	}
 }
 
-func TestDeletedBoxSetIsNotMadeAgain(t *testing.T) {
-	s, api, _ := setup(t)
-	ctx := context.Background()
+// boxSetFixture is a movie library with one box set (TMDB collection 10).
+func boxSetFixture(t *testing.T) (*Syncer, *fakeAPI, *fakeHost) {
+	t.Helper()
+	s, api, host := setup(t)
 	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
 	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10"}
-	if _, err := s.Sync(ctx, true); err != nil {
+	if _, err := s.Sync(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	c := api.bySlug("box-set-10")
-	if c == nil {
+	if api.bySlug("box-set-10") == nil {
 		t.Fatal("box set not made")
 	}
-	delete(api.collections, c.ID)
+	return s, api, host
+}
+
+func TestDeletedBoxSetIsExcludedAndCanComeBack(t *testing.T) {
+	s, api, host := boxSetFixture(t)
+	ctx := context.Background()
+	delete(api.collections, api.bySlug("box-set-10").ID)
 	for range 2 {
 		if _, err := s.Sync(ctx, true); err != nil {
 			t.Fatal(err)
@@ -165,6 +171,78 @@ func TestDeletedBoxSetIsNotMadeAgain(t *testing.T) {
 		if api.bySlug("box-set-10") != nil {
 			t.Fatal("a deleted box set was made again")
 		}
+	}
+	if got, _ := host.settings["excluded_box_sets"].(string); got != "10" || host.settings["api_key"] != "k" {
+		t.Fatalf("settings = %v, want box set 10 excluded and the API key kept", host.settings)
+	}
+	value, _ := structpb.NewStruct(map[string]any{"api_key": "k", "excluded_box_sets": ""})
+	if err := s.Configure(ctx, []*pluginv1.ConfigEntry{{Key: "settings", Value: value}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.bySlug("box-set-10") == nil {
+		t.Fatal("a box set removed from the excluded setting did not come back")
+	}
+}
+
+// 1.1.4 kept box set deletions in hidden state; 1.1.5 moves them into the
+// setting, where they can be undone.
+func TestHiddenBoxSetDeletionMovesIntoTheSetting(t *testing.T) {
+	s, api, host := boxSetFixture(t)
+	ctx := context.Background()
+	delete(api.collections, api.bySlug("box-set-10").ID)
+	st, err := s.loadState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.set(ownedMap, st.owned, ownedKey("lib", "box-set-10"), deletedMark)
+	if err := s.saveState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := host.settings["excluded_box_sets"].(string); got != "10" {
+		t.Fatalf("excluded box sets = %q, want the 1.1.4 deletion moved in", got)
+	}
+	if api.bySlug("box-set-10") != nil {
+		t.Fatal("the deleted box set came back during the move")
+	}
+}
+
+func TestBoxSetAndFranchiseDeletionsShareOneSave(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	host := s.host.(*fakeHost)
+	ctx := context.Background()
+	api.boxSets["10"] = silo.BoxSet{ID: "10", Title: "Alien"}
+	api.movieBoxSet = map[string]string{"m1": "10", "m2": "10"}
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	delete(api.collections, api.bySlug("box-set-10").ID)
+	delete(api.collections, api.bySlug("tvdb-list-7").ID)
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if host.settings["excluded_box_sets"] != "10" || host.settings["excluded_tvdb_lists"] != "7" {
+		t.Fatalf("settings = %v, want both deletions saved", host.settings)
+	}
+}
+
+func TestExcludingABoxSetRemovesItsCollection(t *testing.T) {
+	s, api, _ := boxSetFixture(t)
+	ctx := context.Background()
+	value, _ := structpb.NewStruct(map[string]any{"api_key": "k", "excluded_box_sets": "10"})
+	if err := s.Configure(ctx, []*pluginv1.ConfigEntry{{Key: "settings", Value: value}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.bySlug("box-set-10") != nil {
+		t.Fatal("an excluded box set kept its collection")
 	}
 }
 
