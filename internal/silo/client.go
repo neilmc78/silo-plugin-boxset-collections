@@ -414,6 +414,12 @@ func (c *Client) CreateGroup(ctx context.Context, libraryID, name, slug string) 
 	return out, err
 }
 
+// RenameGroup renames a collection group.
+func (c *Client) RenameGroup(ctx context.Context, id, name string) error {
+	return c.do(ctx, http.MethodPatch, "/api/v2/admin/collection-groups/"+url.PathEscape(id), nil,
+		map[string]any{"name": name}, nil, ifMatchAny)
+}
+
 // NewCollection is what CreateCollection creates.
 type NewCollection struct {
 	LibraryID   string

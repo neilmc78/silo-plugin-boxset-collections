@@ -30,9 +30,7 @@ func (f *fakeTVDB) SeriesLists(_ context.Context, id string) ([]tvdb.ListRef, er
 	}
 	var refs []tvdb.ListRef
 	for _, l := range f.seriesLists[id] {
-		if f.lists[l].Official {
-			refs = append(refs, tvdb.ListRef{ID: l})
-		}
+		refs = append(refs, tvdb.ListRef{ID: l, Official: f.lists[l].Official})
 	}
 	return refs, nil
 }
@@ -184,5 +182,66 @@ func TestParseConfigReadsSeriesSettings(t *testing.T) {
 	value, _ = structpb.NewStruct(map[string]any{"series_min_shows": "lots"})
 	if _, err := ParseConfig([]*pluginv1.ConfigEntry{{Key: "settings", Value: value}}); err == nil {
 		t.Fatal("a non-number minimum was accepted")
+	}
+}
+
+func TestRunReportsAPreviousSyncWithNoOfficialLists(t *testing.T) {
+	s, _, tv := setupSeries(t)
+	ctx := context.Background()
+	// Every list the library's series are on is unofficial.
+	for id, l := range tv.lists {
+		l.Official = false
+		tv.lists[id] = l
+	}
+	if _, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{}); err != nil {
+		t.Fatalf("first Run, with no report yet: %v", err)
+	}
+	s.wg.Wait()
+	_, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{})
+	s.wg.Wait()
+	if err == nil {
+		t.Fatal("Run hid a sync that found no official lists")
+	}
+	for _, want := range []string{"0 official lists (3 unofficial", "0 franchises", "no official list"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q lacks %q", err, want)
+		}
+	}
+
+	// Once a franchise forms, Run reports success again.
+	for id, l := range tv.lists {
+		l.Official = id != "9"
+		tv.lists[id] = l
+	}
+	s.stale["tvlib"] = true
+	s.syncAndRecord(ctx, false)
+	if _, err := s.Run(ctx, &pluginv1.RunScheduledTaskRequest{}); err != nil {
+		s.wg.Wait()
+		t.Fatalf("Run after a clean sync: %v", err)
+	}
+	s.wg.Wait()
+}
+
+func TestSyncRenamesTheGroupToTheSetting(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	ctx := context.Background()
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := structpb.NewStruct(map[string]any{"api_key": "k", "tvdb_api_key": "tv", "series_group_name": "Universes"})
+	if err := s.Configure(ctx, []*pluginv1.ConfigEntry{{Key: "settings", Value: value}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Sync(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, g := range api.groups {
+		if g.Slug == "franchises" {
+			names = append(names, g.Name)
+		}
+	}
+	if !slices.Equal(names, []string{"Universes"}) {
+		t.Fatalf("franchise groups = %v, want the one group renamed to Universes", names)
 	}
 }

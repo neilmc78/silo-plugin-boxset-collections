@@ -139,6 +139,14 @@ func (f *fakeAPI) CreateGroup(_ context.Context, _, name, slug string) (silo.Gro
 	f.groups = append(f.groups, g)
 	return g, nil
 }
+func (f *fakeAPI) RenameGroup(_ context.Context, id, name string) error {
+	for i := range f.groups {
+		if f.groups[i].ID == id {
+			f.groups[i].Name = name
+		}
+	}
+	return nil
+}
 func (f *fakeAPI) CreateCollection(_ context.Context, n silo.NewCollection) (silo.Collection, error) {
 	gid := n.GroupID
 	c := &silo.Collection{ID: f.id("c"), Title: n.Title, Description: n.Description, Slug: n.Slug, GroupID: &gid}

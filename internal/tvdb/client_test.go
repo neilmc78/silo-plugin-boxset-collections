@@ -37,8 +37,8 @@ func stub(t *testing.T) (*Client, *int, *bool) {
 		}
 		switch r.URL.Path {
 		case "/series/361753/extended":
-			if r.URL.Query().Get("short") != "true" {
-				t.Errorf("query %q", r.URL.RawQuery)
+			if r.URL.RawQuery != "" {
+				t.Errorf("query %q, want the full record", r.URL.RawQuery)
 			}
 			_, _ = w.Write([]byte(`{"data":{"lists":[
 				{"id":7,"name":"Yellowstone","isOfficial":true},
@@ -57,14 +57,15 @@ func stub(t *testing.T) (*Client, *int, *bool) {
 	return New(srv.URL, "key", "1234"), &logins, &expire
 }
 
-func TestSeriesListsKeepsOfficialOnly(t *testing.T) {
+func TestSeriesListsFlagsOfficialLists(t *testing.T) {
 	c, logins, _ := stub(t)
 	refs, err := c.SeriesLists(context.Background(), "361753")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 1 || refs[0].ID != "7" || refs[0].Name != "Yellowstone" {
-		t.Fatalf("refs = %+v, want only the official list", refs)
+	want := []ListRef{{ID: "7", Name: "Yellowstone", Official: true}, {ID: "9", Name: "My favourites"}}
+	if !slices.Equal(refs, want) {
+		t.Fatalf("refs = %+v, want %+v", refs, want)
 	}
 	if *logins != 1 {
 		t.Fatalf("logins = %d, want 1", *logins)

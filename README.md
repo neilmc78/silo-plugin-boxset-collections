@@ -35,7 +35,7 @@ TV franchises are off until you set a TheTVDB API key. With a key, on each run, 
 
 Each franchise collection's description ends with `Source: TheTVDB.com (<link to the list>)`. That's the attribution TheTVDB's free API tier requires, shown next to the data viewers see, so leave it in place.
 
-The plugin owns collections with the slug `tvdb-list-<id>` and the group with the slug `franchises`.
+The plugin owns collections with the slug `tvdb-list-<id>` and the group with the slug `franchises`. Changing either group name in the settings renames the group on the next sync.
 
 ### Get a TheTVDB key
 
@@ -52,7 +52,9 @@ Whether a franchise appears depends on TheTVDB marking its list official. If one
 
 - **On a schedule, or when you press Run now** under **Admin → Scheduled Tasks**. This is a full run that looks up every movie again. By default the task runs at server start; add a daily schedule there.
 
-  Silo gives a plugin task 10 seconds to answer, so the task starts the sync in the background and reports success straight away. Collections appear over the next minute or two. The sync's result goes to Silo's log, and the task's result shows the previous sync's report (`last_run`: what was created, updated and removed, and any problems).
+  Silo gives a plugin task 10 seconds to answer, so the task starts the sync in the background and answers straight away. Collections appear over the next minute or two.
+
+  Silo doesn't show a plugin task's output, so when the previous sync hit a problem, the next run is marked **failed** and its **Error** column says what happened. For example: `last sync: …; 1 series libraries, 212 series looked up, 0 official lists (38 unofficial, 0 too small), 0 franchises. TheTVDB has no official list for any of your series`. The new sync still starts. A run after a clean sync shows as completed. The full summary also goes to the container log (`docker logs`), on lines starting `box set collections:`.
 - **After library changes.** About 20 seconds after a library scan or a metadata refresh, a quick run checks new and refreshed movies. A burst of events gives one run.
 
 ## Before you start
