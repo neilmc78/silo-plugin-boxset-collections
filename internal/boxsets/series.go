@@ -42,8 +42,16 @@ type TVDB interface {
 	List(ctx context.Context, id string) (tvdb.List, error)
 }
 
-func seriesKind(cfg Config) collectionKind {
-	return collectionKind{slugPrefix: franchiseSlugPrefix, groupSlug: franchiseGroupSlug, groupName: cfg.SeriesGroupName, noun: "franchise"}
+func (s *Syncer) seriesKind(cfg Config) collectionKind {
+	return collectionKind{
+		slugPrefix: franchiseSlugPrefix, groupSlug: franchiseGroupSlug, groupName: cfg.SeriesGroupName, noun: "franchise",
+		excluded: func(id string) bool { return cfg.Excluded(id) || (s.state != nil && s.state.excluding[id]) },
+		excludeOnDelete: func(id string) {
+			if s.state != nil {
+				s.state.excluding[id] = true
+			}
+		},
+	}
 }
 
 // tvdbClient returns the TheTVDB client for the configured key, kept across
@@ -66,6 +74,7 @@ func (s *Syncer) syncSeries(ctx context.Context, api API, cfg Config, full bool,
 		return nil
 	}
 	tv := s.tvdbClient(cfg)
+	defer s.pruneLists()
 	lists := map[string]listResult{} // read once per sync, shared by libraries
 	for _, lib := range libraries {
 		if err := s.syncSeriesLibrary(ctx, api, tv, cfg, lib, full, stale, lists, report); err != nil {
@@ -199,8 +208,15 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 		if b, ok := franchiseOf(r.list, byTVDB, cfg.SeriesMinShows); ok {
 			want[id] = b
 		} else {
-			tooSmall++
-			report.addNearMiss(nearMissOf(r.list, byTVDB, cfg.SeriesMinShows))
+			// A list with fewer series in all than the minimum can never
+			// form (a film franchise with one spin-off series, say), so it
+			// is counted but not named as a near miss.
+			if miss := nearMissOf(r.list, byTVDB, cfg.SeriesMinShows); miss.Series < miss.Needed {
+				report.ListsNeverForm++
+			} else {
+				tooSmall++
+				report.addNearMiss(miss)
+			}
 		}
 	}
 	report.Franchises += len(want)
@@ -225,7 +241,7 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 		}
 		return true, nil
 	}
-	return s.apply(ctx, api, lib, seriesKind(cfg), want, unreadable, failed, confirmGone, report)
+	return s.apply(ctx, api, lib, s.seriesKind(cfg), want, unreadable, failed, confirmGone, report)
 }
 
 // franchiseOf turns a list into a collection for a library: the list's
@@ -344,15 +360,13 @@ type storedList struct {
 	Fetched int64     `json:"fetched"`
 }
 
-func listKey(id string) string { return "tvdblist:" + id }
-
 // cachedList returns a list's details, reusing a copy younger than
 // listRefetch, on full syncs too: lists change rarely, and each
 // request spends the install's own TheTVDB allowance.
 func (s *Syncer) cachedList(ctx context.Context, tv TVDB, id string) (tvdb.List, error) {
-	if raw, ok, err := s.host.ReadState(ctx, listKey(id)); err == nil && ok {
+	if s.state != nil {
 		var stored storedList
-		if json.Unmarshal(raw, &stored) == nil && s.now().Sub(time.Unix(stored.Fetched, 0)) < listRefetch {
+		if raw, ok := s.state.lists[id]; ok && json.Unmarshal([]byte(raw), &stored) == nil && s.now().Sub(time.Unix(stored.Fetched, 0)) < listRefetch {
 			return stored.List, nil
 		}
 	}
@@ -364,12 +378,31 @@ func (s *Syncer) cachedList(ctx context.Context, tv TVDB, id string) (tvdb.List,
 	return l, nil
 }
 
-func (s *Syncer) saveList(ctx context.Context, l tvdb.List) {
+func (s *Syncer) saveList(_ context.Context, l tvdb.List) {
+	if s.state == nil {
+		return
+	}
 	raw, err := json.Marshal(storedList{List: l, Fetched: s.now().Unix()})
 	if err != nil {
 		return
 	}
-	if err := s.host.WriteState(ctx, listKey(l.ID), raw); err != nil {
-		s.log.Warn("box set collections: could not cache a TheTVDB list", "list", l.ID, "error", err)
+	s.state.set(listsMap, s.state.lists, l.ID, string(raw))
+}
+
+// listForget is how long an unused list's details are kept: lists still
+// in use are fetched again weekly, so older entries belong to lists no
+// series is on any more.
+const listForget = 30 * 24 * time.Hour
+
+// pruneLists drops list details no sync has fetched for listForget.
+func (s *Syncer) pruneLists() {
+	if s.state == nil {
+		return
+	}
+	for id, raw := range s.state.lists {
+		var stored storedList
+		if json.Unmarshal([]byte(raw), &stored) != nil || s.now().Sub(time.Unix(stored.Fetched, 0)) > listForget {
+			s.state.drop(listsMap, s.state.lists, id)
+		}
 	}
 }

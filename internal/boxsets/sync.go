@@ -63,6 +63,9 @@ type Host interface {
 	MovieLibraries(ctx context.Context) ([]Library, error)
 	// SeriesLibraries lists libraries that can hold series.
 	SeriesLibraries(ctx context.Context) ([]Library, error)
+	// SaveSettings replaces the plugin's settings entry, which Silo stores
+	// encrypted the same way as an admin's save.
+	SaveSettings(ctx context.Context, values map[string]any) error
 	// SetStatus shows a sync's report in the plugin's "Last sync" settings
 	// box, the one place in Silo's UI a plugin can write to.
 	SetStatus(ctx context.Context, report string) error
@@ -117,6 +120,10 @@ type Syncer struct {
 	cfg Config
 
 	runMu sync.Mutex // one sync at a time
+	// state is the running sync's shared state; set under runMu.
+	state *syncState
+	// lastStatus is the Last sync text last written; guarded by mu.
+	lastStatus string
 
 	// running is set while a Run's background sync is going; wg lets tests
 	// wait for it.
@@ -175,6 +182,11 @@ func (s *Syncer) Run(ctx context.Context, _ *pluginv1.RunScheduledTaskRequest) (
 	}
 	if !s.running.CompareAndSwap(false, true) {
 		out["status"] = "already running"
+		s.mu.Lock()
+		current := s.lastStatus
+		s.mu.Unlock()
+		s.setStatus(current + fmt.Sprintf("\n\nRun now at %s: this sync is still running. This box updates when it finishes.",
+			time.Now().UTC().Format(time.RFC3339)))
 	} else {
 		s.wg.Add(1)
 		go func() {
@@ -229,6 +241,9 @@ func problemSummary(last any, tvdbKey bool) string {
 		cause = fmt.Sprintf("TheTVDB has no official list for any of your series (%d unofficial lists ignored)", num("unofficial_lists"))
 	case tvdbKey && num("franchises") == 0:
 		cause = "no official list has enough of your series"
+		if n := num("lists_never_form"); n > 0 {
+			cause += fmt.Sprintf(" (%d have too few series in all to ever form)", n)
+		}
 		if misses, _ := r["near_misses"].([]any); len(misses) > 0 {
 			closest := make([]string, 0, len(misses))
 			for _, m := range misses {
@@ -290,6 +305,9 @@ func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
 func (s *Syncer) setStatus(text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	s.mu.Lock()
+	s.lastStatus = text
+	s.mu.Unlock()
 	if err := s.host.SetStatus(ctx, text); err != nil {
 		s.log.Warn("box set collections: could not write the sync status", "error", err)
 	}
@@ -339,6 +357,7 @@ func statusText(r Report, err error, cfg Config, full bool, start, end time.Time
 		line("- series looked up on TheTVDB this sync: %d (others came from the week-long cache)", r.SeriesLooked)
 		line("- official lists your series are on: %d (unofficial lists ignored: %d)", r.ListsOfficial, r.ListsUnofficial)
 		line("- lists with too few of your series: %d (needs %d)", r.ListsTooSmall, max(cfg.SeriesMinShows, 2))
+		line("- lists with fewer than %d series in all, which can never form: %d", max(cfg.SeriesMinShows, 2), r.ListsNeverForm)
 		line("- franchises: %d", r.Franchises)
 		if len(r.NearMisses) > 0 {
 			line("Closest lists that did not form a franchise:")
@@ -349,6 +368,20 @@ func statusText(r Report, err error, cfg Config, full bool, start, end time.Time
 	}
 	line("")
 	line("Collections created %d, updated %d, removed %d.", r.Created, r.Updated, r.Removed)
+	if len(r.Skipped) > 0 {
+		line("")
+		line("Not made because you deleted or excluded them (%d):", len(r.Skipped))
+		for _, n := range r.Skipped[:min(len(r.Skipped), 20)] {
+			line("- %s", n)
+		}
+	}
+	if len(r.ArtworkFailures) > 0 {
+		line("")
+		line("Artwork that could not be set, tried again next sync (%d):", len(r.ArtworkFailures))
+		for _, a := range r.ArtworkFailures[:min(len(r.ArtworkFailures), 5)] {
+			line("- %s", a)
+		}
+	}
 	if len(r.Errors) > 0 {
 		line("")
 		line("Problems (%d):", len(r.Errors))
@@ -435,6 +468,15 @@ type Report struct {
 	ListsOfficial     int
 	ListsUnofficial   int
 	ListsTooSmall     int
+	// ListsNeverForm are official lists with fewer series in all than the
+	// minimum, which no library can make into a franchise.
+	ListsNeverForm int
+	// ArtworkFailures are images the sync could not set; they are tried
+	// again next sync.
+	ArtworkFailures []string
+	// Skipped are collections not made because the admin deleted or
+	// excluded them.
+	Skipped []string
 	// NearMisses are the official lists closest to forming a franchise.
 	NearMisses []NearMiss
 	Created    int
@@ -455,7 +497,7 @@ func (r Report) Map() map[string]any {
 		"libraries": r.Libraries, "movies_looked_up": r.Looked, "box_sets": r.BoxSets,
 		"series_libraries": r.SeriesLibraries, "series_looked_up": r.SeriesLooked, "franchises": r.Franchises,
 		"series_without_tvdb_id": r.SeriesWithoutTVDB, "official_lists": r.ListsOfficial,
-		"unofficial_lists": r.ListsUnofficial, "lists_too_small": r.ListsTooSmall, "near_misses": nearMisses(r.NearMisses),
+		"unofficial_lists": r.ListsUnofficial, "lists_too_small": r.ListsTooSmall, "lists_never_form": r.ListsNeverForm, "near_misses": nearMisses(r.NearMisses),
 		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
 	}
 }
@@ -494,9 +536,28 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 	}
 	api.UseProfile(profile.ID)
 
-	libraries, err := s.host.MovieLibraries(ctx)
+	st, err := s.loadState(ctx)
 	if err != nil {
-		return report, fmt.Errorf("listing libraries: %w", err)
+		return report, fmt.Errorf("reading the plugin's saved state: %w", err)
+	}
+	s.state = st
+	defer func() {
+		// The sync's context may be spent; what it learned still counts.
+		sctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := s.saveState(sctx, st); err != nil {
+			report.Errors = append(report.Errors, err.Error())
+			s.log.Warn("box set collections: could not save state", "error", err)
+		}
+		report.ArtworkFailures = st.artFailures
+		s.state = nil
+	}()
+
+	var libraries []Library
+	if cfg.MovieBoxSets {
+		if libraries, err = s.host.MovieLibraries(ctx); err != nil {
+			return report, fmt.Errorf("listing libraries: %w", err)
+		}
 	}
 	s.pending.Lock()
 	stale := s.stale
@@ -519,7 +580,13 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		report.Libraries++
 	}
 	if cfg.SeriesEnabled() {
-		if err := s.syncSeries(ctx, api, cfg, full, stale, &report); err != nil {
+		err := s.syncSeries(ctx, api, cfg, full, stale, &report)
+		if len(st.excluding) > 0 {
+			if xerr := s.excludeLists(cfg, st.excluding); xerr != nil {
+				report.Errors = append(report.Errors, "adding deleted franchises to the excluded lists: "+xerr.Error())
+			}
+		}
+		if err != nil {
 			s.pending.Lock()
 			for id := range stale {
 				s.stale[id] = true
@@ -672,6 +739,13 @@ type collectionKind struct {
 	groupSlug  string
 	groupName  string
 	noun       string
+	// excluded, when set, names sources the admin excluded: never made, and
+	// removed if they exist.
+	excluded func(id string) bool
+	// excludeOnDelete records a source whose collection the admin deleted
+	// as excluded, where the admin can see and undo it. Without it the
+	// deletion is remembered in the plugin's state.
+	excludeOnDelete func(id string)
 }
 
 func movieKind(cfg Config) collectionKind {
@@ -694,6 +768,25 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 	for _, c := range collections {
 		if id, ok := strings.CutPrefix(c.Slug, kind.slugPrefix); ok && id != "" {
 			have[id] = c
+		}
+	}
+	s.noteDeletions(lib, kind, have, want, report)
+
+	// Excluded sources: their collections go at once, as the admin asked.
+	for _, id := range sortedKeys(want) {
+		if kind.excluded == nil || !kind.excluded(id) {
+			continue
+		}
+		report.Skipped = append(report.Skipped, fmt.Sprintf("%s (%s, excluded)", want[id].Title, id))
+		delete(want, id)
+		if c, ok := have[id]; ok {
+			if err := api.DeleteCollection(ctx, c.ID); err != nil {
+				report.addError(lib, "removing excluded %q: %v", c.Title, err)
+			} else {
+				report.Removed++
+				s.forgetCollection(ctx, lib, kind, id, c.ID)
+			}
+			delete(have, id)
 		}
 	}
 
@@ -730,7 +823,7 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 			report.addError(lib, "removing %q: %v", c.Title, err)
 			continue
 		}
-		s.forgetArtwork(ctx, c.ID)
+		s.forgetCollection(ctx, lib, kind, strings.TrimPrefix(c.Slug, kind.slugPrefix), c.ID)
 		report.Removed++
 	}
 	if len(want) == 0 {
@@ -766,6 +859,9 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 			}
 			report.Created++
 		}
+		if s.state != nil {
+			s.state.set(ownedMap, s.state.owned, ownedKey(lib.ID, kind.slugPrefix+id), c.ID)
+		}
 		changed, err := s.reconcile(ctx, api, c, b, exists)
 		if err != nil {
 			report.addError(lib, "updating %q: %v", b.Title, err)
@@ -776,6 +872,91 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 		}
 	}
 	return nil
+}
+
+// excludeLists adds TheTVDB lists to the excluded lists setting, keeping
+// every other setting as Silo sent it, and updates the plugin's copy.
+func (s *Syncer) excludeLists(cfg Config, ids map[string]bool) error {
+	all := slices.Clone(cfg.ExcludedLists)
+	for id := range ids {
+		all = append(all, id)
+	}
+	all = ParseListIDs(strings.Join(all, ","))
+	values := maps.Clone(cfg.Raw)
+	if values == nil {
+		values = map[string]any{}
+	}
+	values[fieldExcludedLists] = strings.Join(all, ", ")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.host.SaveSettings(ctx, values); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.cfg.ExcludedLists, s.cfg.Raw = all, values
+	s.mu.Unlock()
+	return nil
+}
+
+// noteDeletions finds collections this plugin made that are gone from
+// Silo: their admin deleted them, so they must not come back. A box set's
+// deletion is remembered in the plugin's state; a franchise's list is
+// added to the excluded lists setting, where the admin can undo it. When
+// most of a library's collections of a kind look deleted at once, it is
+// more likely a fault than a decision, so nothing is recorded that run.
+// Sources whose collections were deleted are taken out of want.
+func (s *Syncer) noteDeletions(lib Library, kind collectionKind, have map[string]silo.Collection, want map[string]silo.BoxSet, report *Report) {
+	if s.state == nil {
+		return
+	}
+	prefix := ownedKey(lib.ID, kind.slugPrefix)
+	var gone []string
+	owned := 0
+	for key, value := range s.state.owned {
+		id, ok := strings.CutPrefix(key, prefix)
+		if !ok || id == "" {
+			continue
+		}
+		if value == deletedMark {
+			if b, ok := want[id]; ok {
+				report.Skipped = append(report.Skipped, fmt.Sprintf("%s (%s, you deleted it)", b.Title, id))
+				delete(want, id)
+			}
+			continue
+		}
+		owned++
+		if _, ok := have[id]; !ok {
+			gone = append(gone, id)
+		}
+	}
+	if len(gone) > massRemovalFloor && len(gone)*2 > owned {
+		report.addError(lib, "%d of %d %s collections the plugin made are missing from Silo; not treating them as deleted this sync", len(gone), owned, kind.noun)
+		return
+	}
+	sort.Strings(gone)
+	for _, id := range gone {
+		title := id
+		if b, ok := want[id]; ok {
+			title = b.Title
+		}
+		report.Skipped = append(report.Skipped, fmt.Sprintf("%s (%s, you deleted it)", title, id))
+		delete(want, id)
+		if kind.excludeOnDelete != nil {
+			kind.excludeOnDelete(id)
+			s.state.drop(ownedMap, s.state.owned, prefix+id)
+		} else {
+			s.state.set(ownedMap, s.state.owned, prefix+id, deletedMark)
+		}
+	}
+}
+
+// forgetCollection drops what the plugin kept about a collection it
+// removed itself.
+func (s *Syncer) forgetCollection(ctx context.Context, lib Library, kind collectionKind, id, collectionID string) {
+	s.forgetArtwork(ctx, collectionID)
+	if s.state != nil {
+		s.state.drop(ownedMap, s.state.owned, ownedKey(lib.ID, kind.slugPrefix+id))
+	}
 }
 
 // addError records one failure in a library without stopping its sync.
@@ -846,17 +1027,16 @@ type artworkSlot struct {
 	Set string `json:"set"`
 }
 
-func artworkKey(collectionID string) string { return "art:" + collectionID }
+// legacyArtworkKey is where versions before 1.1.4 kept a collection's
+// artwork state, one key each.
+func legacyArtworkKey(collectionID string) string { return "art:" + collectionID }
 
 // syncArtwork sets the box set's poster and backdrop on a collection that has
 // none of its own, and replaces them when the box set's change. An image the
 // admin uploaded is never touched. Failures are logged, not fatal: artwork
 // is retried on the next run.
 func (s *Syncer) syncArtwork(ctx context.Context, api API, c silo.Collection, b silo.BoxSet) bool {
-	state := artworkState{}
-	if raw, ok, err := s.host.ReadState(ctx, artworkKey(c.ID)); err == nil && ok {
-		_ = json.Unmarshal(raw, &state)
-	}
+	state := s.artworkStateOf(ctx, c.ID)
 	changed := false
 	for _, a := range []struct {
 		kind, curURL, curHash, srcURL, srcHash string
@@ -881,6 +1061,9 @@ func (s *Syncer) syncArtwork(ctx context.Context, api API, c silo.Collection, b 
 		after, err := s.setArtwork(ctx, api, c.ID, a.kind, a.srcURL)
 		if err != nil {
 			s.log.Warn("box set collections: could not set artwork", "collection", c.Title, "kind", a.kind, "error", err)
+			if s.state != nil {
+				s.state.artFailures = append(s.state.artFailures, fmt.Sprintf("%s %s: %v", c.Title, a.kind, err))
+			}
 			continue
 		}
 		set := imageIdentity(after.PosterURL, after.PosterHash)
@@ -890,14 +1073,29 @@ func (s *Syncer) syncArtwork(ctx context.Context, api API, c silo.Collection, b 
 		state[a.kind] = artworkSlot{Src: src, Set: set}
 		changed = true
 	}
-	if changed {
+	if changed && s.state != nil {
 		if raw, err := json.Marshal(state); err == nil {
-			if err := s.host.WriteState(ctx, artworkKey(c.ID), raw); err != nil {
-				s.log.Warn("box set collections: could not save artwork state", "error", err)
-			}
+			s.state.set(artworkMap, s.state.artwork, c.ID, string(raw))
 		}
 	}
 	return changed
+}
+
+// artworkStateOf returns what the plugin knows about a collection's
+// artwork: from the shared artwork map, or from the per-collection key
+// versions before 1.1.4 used, which is read but never written again.
+func (s *Syncer) artworkStateOf(ctx context.Context, collectionID string) artworkState {
+	state := artworkState{}
+	if s.state != nil {
+		if raw, ok := s.state.artwork[collectionID]; ok {
+			_ = json.Unmarshal([]byte(raw), &state)
+			return state
+		}
+	}
+	if raw, ok, err := s.host.ReadState(ctx, legacyArtworkKey(collectionID)); err == nil && ok {
+		_ = json.Unmarshal(raw, &state)
+	}
+	return state
 }
 
 // setArtwork has Silo fetch the image itself, which saves the plugin a
@@ -917,8 +1115,11 @@ func (s *Syncer) setArtwork(ctx context.Context, api API, collectionID, kind, ad
 	return api.UploadArtwork(ctx, collectionID, kind, image, contentType)
 }
 
-func (s *Syncer) forgetArtwork(ctx context.Context, collectionID string) {
-	_ = s.host.WriteState(ctx, artworkKey(collectionID), []byte("{}"))
+func (s *Syncer) forgetArtwork(_ context.Context, collectionID string) {
+	if s.state != nil {
+		// An empty entry also hides a legacy key's state.
+		s.state.set(artworkMap, s.state.artwork, collectionID, "{}")
+	}
 }
 
 // imageIdentity names an image stably: its thumbhash when Silo has one, else
@@ -986,10 +1187,8 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// The cache maps a library's movies to their box set ID ("" for none). It is
-// kept in the host's instance state, split into chunks that stay well under
-// the host's per-key limit.
-const cacheChunk = 2500
+// The caches map a library's titles to what the sync learned about them.
+// Each is a chunked map (see state.go) named "<prefix>:<library>".
 
 // cacheSaveEvery is how many lookups pass between saves of the cache during
 // a sync.
@@ -1005,60 +1204,13 @@ const (
 	seriesCache = "tvdb2"
 )
 
-func cacheKey(prefix, libraryID string, n int) string {
-	return fmt.Sprintf("%s:%s:%d", prefix, libraryID, n)
-}
-func cacheCountKey(prefix, libraryID string) string { return prefix + ":" + libraryID + ":chunks" }
-
 func (s *Syncer) loadCache(ctx context.Context, prefix, libraryID string) (map[string]string, error) {
-	out := map[string]string{}
-	raw, ok, err := s.host.ReadState(ctx, cacheCountKey(prefix, libraryID))
-	if err != nil || !ok {
-		return out, err
-	}
-	var chunks int
-	if err := json.Unmarshal(raw, &chunks); err != nil {
-		return out, nil
-	}
-	for i := 0; i < chunks; i++ {
-		raw, ok, err := s.host.ReadState(ctx, cacheKey(prefix, libraryID, i))
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			continue
-		}
-		var part map[string]string
-		if json.Unmarshal(raw, &part) == nil {
-			for k, v := range part {
-				out[k] = v
-			}
-		}
-	}
-	return out, nil
+	return s.loadMap(ctx, prefix+":"+libraryID)
 }
 
 func (s *Syncer) saveCache(ctx context.Context, prefix, libraryID string, m map[string]string) error {
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
+	if err := s.saveMap(ctx, prefix+":"+libraryID, m); err != nil {
+		return fmt.Errorf("saving the cache: %w", err)
 	}
-	sort.Strings(ids)
-	chunks := 0
-	for start := 0; start < len(ids); start += cacheChunk {
-		part := map[string]string{}
-		for _, id := range ids[start:min(start+cacheChunk, len(ids))] {
-			part[id] = m[id]
-		}
-		raw, err := json.Marshal(part)
-		if err != nil {
-			return err
-		}
-		if err := s.host.WriteState(ctx, cacheKey(prefix, libraryID, chunks), raw); err != nil {
-			return fmt.Errorf("saving the cache: %w", err)
-		}
-		chunks++
-	}
-	raw, _ := json.Marshal(chunks)
-	return s.host.WriteState(ctx, cacheCountKey(prefix, libraryID), raw)
+	return nil
 }

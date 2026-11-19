@@ -284,8 +284,9 @@ func TestRunSaysWhenAListHasNoSeries(t *testing.T) {
 		tv.lists[id] = l
 	}
 	err := runTwice(t, s)
-	if err == nil || !strings.Contains(err.Error(), "matched 0 of your series (list has 0 series") {
-		t.Fatalf("err = %v, want the empty list named", err)
+	// A list with no series can never form, so it is counted, not named.
+	if err == nil || !strings.Contains(err.Error(), "have too few series in all to ever form") || strings.Contains(err.Error(), "Closest") {
+		t.Fatalf("err = %v, want the empty lists counted and not named", err)
 	}
 }
 

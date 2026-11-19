@@ -79,6 +79,17 @@ func (host) SeriesLibraries(ctx context.Context) ([]boxsets.Library, error) {
 // plugin writes and Silo shows on the plugin's page.
 const statusKey = "status"
 
+// settingsKey is the manifest's settings entry.
+const settingsKey = "settings"
+
+func (host) SaveSettings(ctx context.Context, values map[string]any) error {
+	c, err := client()
+	if err != nil {
+		return err
+	}
+	return c.SetGlobalConfigEntry(ctx, settingsKey, values)
+}
+
 func (host) SetStatus(ctx context.Context, report string) error {
 	c, err := client()
 	if err != nil {
