@@ -18,9 +18,18 @@ import (
 )
 
 type fakeHost struct {
-	mu     sync.Mutex
-	state  map[string][]byte
-	status []string
+	mu       sync.Mutex
+	state    map[string][]byte
+	status   []string
+	settings map[string]any
+	maxKeys  int
+}
+
+func (h *fakeHost) SaveSettings(_ context.Context, values map[string]any) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.settings = values
+	return nil
 }
 
 func (h *fakeHost) SetStatus(_ context.Context, report string) error {
@@ -46,6 +55,10 @@ func (h *fakeHost) ReadState(_ context.Context, k string) ([]byte, bool, error) 
 func (h *fakeHost) WriteState(_ context.Context, k string, v []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Like Silo, refuse a new key once the scope holds maxKeys.
+	if _, exists := h.state[k]; !exists && h.maxKeys > 0 && len(h.state) >= h.maxKeys {
+		return fmt.Errorf("rpc error: code = ResourceExhausted desc = instance state scope holds the maximum of 256 keys")
+	}
 	h.state[k] = v
 	return nil
 }
@@ -385,18 +398,31 @@ func TestSyncNeedsAPIKey(t *testing.T) {
 }
 
 func TestCacheRoundTripsAcrossChunks(t *testing.T) {
-	s, _, _ := setup(t)
+	s, _, host := setup(t)
 	ctx := context.Background()
+	// About 1.2 MB of entries: several chunks, each under Silo's value cap.
 	m := map[string]string{}
-	for i := range cacheChunk*2 + 7 {
-		m[fmt.Sprintf("m%05d", i)] = fmt.Sprint(i % 3)
+	for i := range 6000 {
+		m[fmt.Sprintf("movie:%07d", i)] = strings.Repeat("x", 180) + fmt.Sprint(i%3)
 	}
 	if err := s.saveCache(ctx, movieCache, "lib", m); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.loadCache(ctx, movieCache, "lib")
-	if err != nil || len(got) != len(m) || got["m00004"] != "1" {
+	if err != nil || len(got) != len(m) || got["movie:0000004"] != m["movie:0000004"] {
 		t.Fatalf("got %d entries, err %v", len(got), err)
+	}
+	chunks := 0
+	for k, v := range host.state {
+		if strings.HasPrefix(k, "cache:lib:") && k != "cache:lib:chunks" {
+			chunks++
+			if len(v) > 256<<10 {
+				t.Fatalf("chunk %s is %d bytes, over Silo's 256 KB value cap", k, len(v))
+			}
+		}
+	}
+	if chunks < 5 {
+		t.Fatalf("chunks = %d, want the cache split by size", chunks)
 	}
 }
 

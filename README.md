@@ -26,7 +26,7 @@ If you ran a Silo build with box set collections built in, those collections use
 
 ## TV franchises
 
-TV franchises need the **TV franchises** switch on (it is by default) and a TheTVDB API key, both in the plugin's settings. Series libraries need no setting of their own in Silo: unlike movie box sets, which Silo builds and the plugin reads, franchises come straight from TheTVDB. With a key, on each run, for every series library (and mixed library):
+TV franchises need the **TV Franchises via theTVDB.com** switch on (it is by default) and a TheTVDB API key in **TheTVDB options**. Series libraries need no setting of their own in Silo: unlike movie box sets, which Silo builds and the plugin reads, franchises come straight from TheTVDB. With a key, on each run, for every series library (and mixed library):
 
 1. Reads each series' TheTVDB ID from Silo. Series Silo has no TheTVDB ID for are skipped and counted in the task's output (`series_without_tvdb_id`).
 2. Asks TheTVDB which **official** lists each series is on. Lists anyone can make, such as "My favourites", are ignored. Answers are cached: quick runs only look up new or refreshed series, and full runs look a series up again after a week.
@@ -43,10 +43,25 @@ Every server uses its own key; the plugin doesn't ship one.
 
 1. Sign up on [TheTVDB's API page](https://thetvdb.com/api-information).
 2. Choose the free tier (projects under $50k a year, attribution required). Name the project after your server, for example "Silo Box Set Collections on my home server", and describe it as a plugin that groups the series in your own library into franchise collections.
-3. In the plugin's **Settings**, leave **TV franchises** on and paste the key in the **TheTVDB** section as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
+3. In the plugin's **Settings**, leave **TV Franchises via theTVDB.com** on and paste the key in **TheTVDB options** as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
 4. Press **Run now** under **Admin → Scheduled Tasks**.
 
 Whether a franchise appears depends on TheTVDB marking its list official. If one you expect is missing, check its page on thetvdb.com.
+
+## Deleting and excluding collections
+
+A collection you delete stays deleted:
+
+- **A TV franchise:** its TheTVDB list ID is added to **Excluded TheTVDB lists** in the plugin's settings. Remove the ID there to bring the collection back on the next sync. You can also add IDs yourself (the number in a list's thetvdb.com address, or shown beside it in the Last sync box) to skip a list before it is ever made.
+- **A movie box set:** the plugin remembers the deletion and doesn't make it again.
+
+To keep a collection but hide it from viewers, hide it instead: the plugin never changes a collection's visibility.
+
+If many of a library's collections vanish at once, the plugin assumes something went wrong rather than that you deleted them all, and records nothing that sync.
+
+## Upgrading to 1.1.4
+
+Versions before 1.1.4 used one storage key per collection, and Silo allows a plugin 256 keys with no way to delete one. If the Last sync box says the plugin's storage is full, uninstall and reinstall the plugin once to clear it, then enter the API keys again. Your collections stay; the plugin picks them back up. From 1.1.4 the plugin uses a few dozen keys at most, however large the library.
 
 ## When it runs
 
@@ -65,10 +80,10 @@ Whether a franchise appears depends on TheTVDB marking its list official. If one
 
 ## Setup
 
-1. Turn on **Box sets** for your movie libraries in the library settings, if they are not on already.
+1. For movie box sets, turn on **Box sets** for your movie libraries in the library settings (Metadata), if they are not on already.
 2. In **Admin → API Keys**, create a key with **no scopes** for the server Owner account, or for another administrator. Profile PINs don't matter, because API keys skip them. The Owner account is the best choice: other admins can't revoke or change keys on it.
-3. Install the plugin from **Admin → Plugins**, then paste the key under its **Settings**. You can also change the group name there. **Silo URL** is needed only if the plugin can't reach Silo on the address the server reports for itself.
-4. Restart Silo, from **Admin → Maintenance** or by restarting the container. Silo only lists a plugin's scheduled tasks at startup, and the restart also runs the first sync.
+3. Install the plugin from **Admin → Plugins**, then paste the key under its **Settings → Silo connection**. Turn **Movie box sets** and **TV Franchises via theTVDB.com** on or off as you like; each works without the other, and turning one off hides its options. **Silo URL** is needed only if the plugin can't reach Silo on the address the server reports for itself.
+4. Restart Silo, by restarting its container or service. Silo only lists a plugin's scheduled tasks at startup, and the restart also runs the first sync.
 5. Under **Admin → Scheduled Tasks**, find **Sync box set collections (neilmc78.collections.boxsets)** in the System category and give it a daily schedule. Silo's own **Sync Movie Box Sets** is a different task: it builds the box set data this plugin reads.
 
 The plugin stays under Silo's rate limit for API keys (10 requests a second, half a standard key's allowance), so a first run on a large library takes a few minutes. Later runs only look up new movies and box sets.
