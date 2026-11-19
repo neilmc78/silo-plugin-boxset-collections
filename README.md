@@ -26,7 +26,7 @@ If you ran a Silo build with box set collections built in, those collections use
 
 ## TV franchises
 
-TV franchises are off until you set a TheTVDB API key. With a key, on each run, for every series library (and mixed library):
+TV franchises need the **TV franchises** switch on (it is by default) and a TheTVDB API key, both in the plugin's settings. Series libraries need no setting of their own in Silo: unlike movie box sets, which Silo builds and the plugin reads, franchises come straight from TheTVDB. With a key, on each run, for every series library (and mixed library):
 
 1. Reads each series' TheTVDB ID from Silo. Series Silo has no TheTVDB ID for are skipped and counted in the task's output (`series_without_tvdb_id`).
 2. Asks TheTVDB which **official** lists each series is on. Lists anyone can make, such as "My favourites", are ignored. Answers are cached: quick runs only look up new or refreshed series, and full runs look a series up again after a week.
@@ -43,7 +43,7 @@ Every server uses its own key; the plugin doesn't ship one.
 
 1. Sign up on [TheTVDB's API page](https://thetvdb.com/api-information).
 2. Choose the free tier (projects under $50k a year, attribution required). Name the project after your server, for example "Silo Box Set Collections on my home server", and describe it as a plugin that groups the series in your own library into franchise collections.
-3. Paste the key under the plugin's **Settings** as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
+3. In the plugin's **Settings**, leave **TV franchises** on and paste the key in the **TheTVDB** section as **TheTVDB API key**. Leave **TheTVDB PIN** empty unless your key is a subscriber key that came with one.
 4. Press **Run now** under **Admin → Scheduled Tasks**.
 
 Whether a franchise appears depends on TheTVDB marking its list official. If one you expect is missing, check its page on thetvdb.com.

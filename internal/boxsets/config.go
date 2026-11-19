@@ -19,6 +19,7 @@ const (
 	fieldTVDBPin         = "tvdb_pin"
 	fieldSeriesGroupName = "series_group_name"
 	fieldSeriesMinShows  = "series_min_shows"
+	fieldTVFranchises    = "tv_franchises"
 
 	defaultGroupName       = "Box Sets"
 	defaultSeriesGroupName = "Franchises"
@@ -41,6 +42,9 @@ type Config struct {
 	TVDBPin    string
 	// SeriesGroupName names the collection group series franchises go in.
 	SeriesGroupName string
+	// TVFranchises is the settings switch for series franchises; they run
+	// only when it is on and a TheTVDB key is set.
+	TVFranchises bool
 	// SeriesMinShows is how many of a list's series a library needs before
 	// the list becomes a collection there.
 	SeriesMinShows int
@@ -49,12 +53,28 @@ type Config struct {
 // ParseConfig reads Configure entries. Missing values take their defaults;
 // it fails only on values of the wrong type.
 func ParseConfig(entries []*pluginv1.ConfigEntry) (Config, error) {
-	cfg := Config{GroupName: defaultGroupName, SeriesGroupName: defaultSeriesGroupName, SeriesMinShows: defaultSeriesMinShows}
+	// TV franchises default to on, so an install that set a TheTVDB key
+	// before the switch existed keeps them.
+	cfg := Config{GroupName: defaultGroupName, SeriesGroupName: defaultSeriesGroupName, SeriesMinShows: defaultSeriesMinShows, TVFranchises: true}
 	for _, entry := range entries {
 		if entry.GetKey() != configKey {
 			continue
 		}
 		values := entry.GetValue().AsMap()
+		if raw, ok := values[fieldTVFranchises]; ok && raw != nil {
+			switch v := raw.(type) {
+			case bool:
+				cfg.TVFranchises = v
+			case string:
+				on, err := strconv.ParseBool(strings.TrimSpace(v))
+				if err != nil {
+					return Config{}, fmt.Errorf("%s.%s must be true or false", configKey, fieldTVFranchises)
+				}
+				cfg.TVFranchises = on
+			default:
+				return Config{}, fmt.Errorf("%s.%s must be true or false", configKey, fieldTVFranchises)
+			}
+		}
 		if raw, ok := values[fieldSeriesMinShows]; ok && raw != nil {
 			n, err := minShows(raw)
 			if err != nil {
@@ -110,3 +130,7 @@ func minShows(raw any) (int, error) {
 	}
 	return min(max(n, 2), maxSeriesMinShows), nil
 }
+
+// SeriesEnabled reports whether series franchises run: the switch is on and
+// a TheTVDB key is set.
+func (c Config) SeriesEnabled() bool { return c.TVFranchises && c.TVDBAPIKey != "" }

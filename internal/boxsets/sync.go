@@ -148,7 +148,7 @@ func (s *Syncer) Configure(_ context.Context, entries []*pluginv1.ConfigEntry) e
 		return err
 	}
 	// Whether a TheTVDB key arrived, never the key itself.
-	s.log.Info("box set collections: configured", "tvdb_key", cfg.TVDBAPIKey != "",
+	s.log.Info("box set collections: configured", "tv_franchises", cfg.TVFranchises, "tvdb_key", cfg.TVDBAPIKey != "",
 		"series_group", cfg.SeriesGroupName, "series_min_shows", cfg.SeriesMinShows)
 	s.mu.Lock()
 	s.cfg = cfg
@@ -192,7 +192,7 @@ func (s *Syncer) Run(ctx context.Context, _ *pluginv1.RunScheduledTaskRequest) (
 	// Silo shows a plugin task's error but not its output, so a problem
 	// the previous sync met is reported as this run's error. The new sync
 	// has started all the same.
-	if problem := problemSummary(out["last_run"], s.config().TVDBAPIKey != ""); problem != "" {
+	if problem := problemSummary(out["last_run"], s.config().SeriesEnabled()); problem != "" {
 		return nil, errors.New(problem)
 	}
 	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
@@ -260,8 +260,8 @@ const lastReportKey = "last_report"
 func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
 	start := time.Now()
 	cfg := s.config()
-	s.setStatus(fmt.Sprintf("Sync started %s (%s), plugin v%s, TheTVDB key: %s.\nIf this stays for more than an hour, the sync stopped before finishing.",
-		start.UTC().Format(time.RFC3339), runKind(full), s.Version, presence(cfg.TVDBAPIKey != "")))
+	s.setStatus(fmt.Sprintf("Sync started %s (%s), plugin v%s, TV franchises: %s, TheTVDB key: %s.\nIf this stays for more than an hour, the sync stopped before finishing.",
+		start.UTC().Format(time.RFC3339), runKind(full), s.Version, onOff(cfg.TVFranchises), presence(cfg.TVDBAPIKey != "")))
 	report, err := s.Sync(ctx, full)
 	s.setStatus(statusText(report, err, cfg, full, start, time.Now(), s.Version))
 	record := report.Map()
@@ -302,6 +302,13 @@ func runKind(full bool) string {
 	return "quick, after a library change"
 }
 
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
+}
+
 func presence(ok bool) string {
 	if ok {
 		return "present"
@@ -321,9 +328,12 @@ func statusText(r Report, err error, cfg Config, full bool, start, end time.Time
 	line("")
 	line("Movies: %d libraries, %d box sets, %d movies looked up.", r.Libraries, r.BoxSets, r.Looked)
 	line("")
-	if cfg.TVDBAPIKey == "" {
+	switch {
+	case !cfg.TVFranchises:
+		line("TV franchises: off in the plugin's settings.")
+	case cfg.TVDBAPIKey == "":
 		line("TV franchises: skipped, because the settings the plugin received have no TheTVDB API key.")
-	} else {
+	default:
 		line("TV franchises: %d series libraries synced.", r.SeriesLibraries)
 		line("- series without a TheTVDB ID in Silo: %d", r.SeriesWithoutTVDB)
 		line("- series looked up on TheTVDB this sync: %d (others came from the week-long cache)", r.SeriesLooked)
@@ -508,7 +518,7 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 		}
 		report.Libraries++
 	}
-	if cfg.TVDBAPIKey != "" {
+	if cfg.SeriesEnabled() {
 		if err := s.syncSeries(ctx, api, cfg, full, stale, &report); err != nil {
 			s.pending.Lock()
 			for id := range stale {
