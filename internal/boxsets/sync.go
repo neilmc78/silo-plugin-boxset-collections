@@ -63,6 +63,9 @@ type Host interface {
 	MovieLibraries(ctx context.Context) ([]Library, error)
 	// SeriesLibraries lists libraries that can hold series.
 	SeriesLibraries(ctx context.Context) ([]Library, error)
+	// SetStatus shows a sync's report in the plugin's "Last sync" settings
+	// box, the one place in Silo's UI a plugin can write to.
+	SetStatus(ctx context.Context, report string) error
 	ReadState(ctx context.Context, key string) ([]byte, bool, error)
 	WriteState(ctx context.Context, key string, value []byte) error
 }
@@ -96,6 +99,9 @@ type API interface {
 type Syncer struct {
 	pluginv1.UnimplementedScheduledTaskServer
 	pluginv1.UnimplementedEventConsumerServer
+
+	// Version is the plugin's version, shown in the sync status.
+	Version string
 
 	log    *slog.Logger
 	host   Host
@@ -230,7 +236,7 @@ func problemSummary(last any, tvdbKey bool) string {
 					closest = append(closest, s)
 				}
 			}
-			cause += ". Closest: " + strings.Join(closest, "; ")
+			cause += ". Closest: " + strings.Join(closest[:min(len(closest), 3)], "; ")
 		}
 	default:
 		return ""
@@ -253,7 +259,11 @@ const lastReportKey = "last_report"
 // Run's output.
 func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
 	start := time.Now()
+	cfg := s.config()
+	s.setStatus(fmt.Sprintf("Sync started %s (%s), plugin v%s, TheTVDB key: %s.\nIf this stays for more than an hour, the sync stopped before finishing.",
+		start.UTC().Format(time.RFC3339), runKind(full), s.Version, presence(cfg.TVDBAPIKey != "")))
 	report, err := s.Sync(ctx, full)
+	s.setStatus(statusText(report, err, cfg, full, start, time.Now(), s.Version))
 	record := report.Map()
 	record["full"] = full
 	record["finished_at"] = time.Now().UTC().Format(time.RFC3339)
@@ -273,6 +283,70 @@ func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
 			s.log.Warn("box set collections: could not save the sync report", "error", wErr)
 		}
 	}
+}
+
+// setStatus writes the plugin's "Last sync" box. A failure is logged; it
+// never fails the sync.
+func (s *Syncer) setStatus(text string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.host.SetStatus(ctx, text); err != nil {
+		s.log.Warn("box set collections: could not write the sync status", "error", err)
+	}
+}
+
+func runKind(full bool) string {
+	if full {
+		return "full"
+	}
+	return "quick, after a library change"
+}
+
+func presence(ok bool) string {
+	if ok {
+		return "present"
+	}
+	return "missing"
+}
+
+// statusText is a sync's report as plain text, one fact per line, for the
+// plugin's "Last sync" box.
+func statusText(r Report, err error, cfg Config, full bool, start, end time.Time, version string) string {
+	var b strings.Builder
+	line := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
+	line("Sync finished %s (%s, %s), plugin v%s.", end.UTC().Format(time.RFC3339), runKind(full), end.Sub(start).Round(time.Second), version)
+	if err != nil {
+		line("It stopped with an error: %v", err)
+	}
+	line("")
+	line("Movies: %d libraries, %d box sets, %d movies looked up.", r.Libraries, r.BoxSets, r.Looked)
+	line("")
+	if cfg.TVDBAPIKey == "" {
+		line("TV franchises: skipped, because the settings the plugin received have no TheTVDB API key.")
+	} else {
+		line("TV franchises: %d series libraries synced.", r.SeriesLibraries)
+		line("- series without a TheTVDB ID in Silo: %d", r.SeriesWithoutTVDB)
+		line("- series looked up on TheTVDB this sync: %d (others came from the week-long cache)", r.SeriesLooked)
+		line("- official lists your series are on: %d (unofficial lists ignored: %d)", r.ListsOfficial, r.ListsUnofficial)
+		line("- lists with too few of your series: %d (needs %d)", r.ListsTooSmall, max(cfg.SeriesMinShows, 2))
+		line("- franchises: %d", r.Franchises)
+		if len(r.NearMisses) > 0 {
+			line("Closest lists that did not form a franchise:")
+			for _, n := range r.NearMisses {
+				line("- %s", n)
+			}
+		}
+	}
+	line("")
+	line("Collections created %d, updated %d, removed %d.", r.Created, r.Updated, r.Removed)
+	if len(r.Errors) > 0 {
+		line("")
+		line("Problems (%d):", len(r.Errors))
+		for _, e := range r.Errors[:min(len(r.Errors), 10)] {
+			line("- %s", e)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func (s *Syncer) lastReport(ctx context.Context) map[string]any {

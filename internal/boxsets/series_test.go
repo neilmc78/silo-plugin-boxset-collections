@@ -296,3 +296,37 @@ func TestRunStaysQuietWithoutATVDBKey(t *testing.T) {
 		t.Fatalf("Run without a TheTVDB key: %v", err)
 	}
 }
+
+func TestSyncWritesItsReportToThePluginPage(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	host := s.host.(*fakeHost)
+	s.Version = "1.1.3"
+	api.series = []silo.SeriesRef{{ContentID: "s3", TvdbID: "300"}, {ContentID: "s9"}}
+	s.syncAndRecord(context.Background(), true)
+	if len(host.status) != 2 {
+		t.Fatalf("status writes = %d, want started then finished", len(host.status))
+	}
+	if !strings.HasPrefix(host.status[0], "Sync started") || !strings.Contains(host.status[0], "TheTVDB key: present") {
+		t.Fatalf("start status = %q", host.status[0])
+	}
+	done := host.status[1]
+	for _, want := range []string{
+		"plugin v1.1.3",
+		"series without a TheTVDB ID in Silo: 1",
+		"franchises: 0",
+		"- Yellowstone (7) matched 1 of your series (list has 4 series; needs 2)",
+	} {
+		if !strings.Contains(done, want) {
+			t.Fatalf("finished status lacks %q:\n%s", want, done)
+		}
+	}
+}
+
+func TestStatusSaysWhenTheTVDBKeyIsMissing(t *testing.T) {
+	s, _, _ := setup(t)
+	host := s.host.(*fakeHost)
+	s.syncAndRecord(context.Background(), true)
+	if got := host.status[len(host.status)-1]; !strings.Contains(got, "skipped, because the settings the plugin received have no TheTVDB API key") {
+		t.Fatalf("status = %q", got)
+	}
+}

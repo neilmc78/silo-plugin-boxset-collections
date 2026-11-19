@@ -75,6 +75,18 @@ func (host) SeriesLibraries(ctx context.Context) ([]boxsets.Library, error) {
 	return libraries(ctx, seriesTypes)
 }
 
+// statusKey is the manifest's "Last sync" settings entry, which the
+// plugin writes and Silo shows on the plugin's page.
+const statusKey = "status"
+
+func (host) SetStatus(ctx context.Context, report string) error {
+	c, err := client()
+	if err != nil {
+		return err
+	}
+	return c.SetGlobalConfigEntry(ctx, statusKey, map[string]any{"report": report})
+}
+
 func (host) ReadState(ctx context.Context, key string) ([]byte, bool, error) {
 	c, err := client()
 	if err != nil {

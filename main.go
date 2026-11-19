@@ -21,6 +21,7 @@ func main() {
 	// go-plugin forwards the plugin's stderr to the host log.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	syncer := boxsets.New(logger, host{}, nil)
+	syncer.Version = version
 	runtime.ServeManifestWithOptions(manifestJSON, version,
 		runtime.CapabilityServers{ScheduledTask: syncer, EventConsumer: syncer},
 		runtime.WithConfigure(syncer.Configure),

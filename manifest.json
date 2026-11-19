@@ -1,6 +1,6 @@
 {
   "plugin_id": "neilmc78.collections.boxsets",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "category": "Collections",
@@ -88,6 +88,24 @@
             "control": "ADMIN_FORM_CONTROL_NUMBER",
             "default_value": 2,
             "placeholder": "2"
+          }
+        ]
+      }
+    },
+    {
+      "key": "status",
+      "title": "Last sync",
+      "description": "Written by the plugin at the start and end of every sync: what it found and why franchises did or did not form. Edits here are overwritten.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"report\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save",
+        "fields": [
+          {
+            "key": "report",
+            "label": "Report",
+            "description": "Reload this page to see the latest sync.",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA"
           }
         ]
       }
