@@ -65,8 +65,9 @@ func New(base, apiKey, pin string) *Client {
 
 // ListRef is a list a series is on.
 type ListRef struct {
-	ID   string
-	Name string
+	ID       string
+	Name     string
+	Official bool
 }
 
 // List is one TheTVDB list with its series, in list order.
@@ -108,20 +109,22 @@ type listRecord struct {
 	} `json:"entities"`
 }
 
-// SeriesLists returns the official lists a series is on.
+// SeriesLists returns every list a series is on, official or not. It reads
+// the full extended record: the short one's documentation does not promise
+// it keeps the lists.
 func (c *Client) SeriesLists(ctx context.Context, seriesID string) ([]ListRef, error) {
 	var out struct {
 		Data struct {
 			Lists []listRecord `json:"lists"`
 		} `json:"data"`
 	}
-	if err := c.get(ctx, "/series/"+seriesID+"/extended?short=true", &out); err != nil {
+	if err := c.get(ctx, "/series/"+seriesID+"/extended", &out); err != nil {
 		return nil, err
 	}
 	var refs []ListRef
 	for _, l := range out.Data.Lists {
-		if l.IsOfficial && l.ID > 0 {
-			refs = append(refs, ListRef{ID: strconv.FormatInt(l.ID, 10), Name: l.Name})
+		if l.ID > 0 {
+			refs = append(refs, ListRef{ID: strconv.FormatInt(l.ID, 10), Name: l.Name, Official: l.IsOfficial})
 		}
 	}
 	return refs, nil

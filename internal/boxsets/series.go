@@ -117,7 +117,7 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 	for _, tvdbID := range sortedKeys(byTVDB) {
 		contentID := byTVDB[tvdbID]
 		entry, cached := cache[contentID]
-		checked, cachedID, ids := parseSeriesEntry(entry)
+		checked, cachedID, _, _ := parseSeriesEntry(entry)
 		if cached && cachedID == tvdbID && !stale[contentID] && !stale[lib.ID] && (!full || now.Sub(checked) < seriesRecheck) {
 			next[contentID] = entry
 			continue
@@ -138,11 +138,15 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 			continue
 		}
 		report.SeriesLooked++
-		ids = ids[:0]
+		var official, unofficial []string
 		for _, r := range refs {
-			ids = append(ids, r.ID)
+			if r.Official {
+				official = append(official, r.ID)
+			} else {
+				unofficial = append(unofficial, r.ID)
+			}
 		}
-		next[contentID] = formatSeriesEntry(now, tvdbID, ids)
+		next[contentID] = formatSeriesEntry(now, tvdbID, official, unofficial)
 		if report.SeriesLooked%cacheSaveEvery == 0 {
 			partial := maps.Clone(cache)
 			maps.Copy(partial, next)
@@ -155,14 +159,22 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 		return err
 	}
 
-	// The lists that form a franchise in this library.
+	// The lists that form a franchise in this library. Unofficial lists
+	// are only counted, so the task can say when they are all there is.
 	listIDs := map[string]bool{}
+	unofficialIDs := map[string]bool{}
 	for _, entry := range next {
-		_, _, ids := parseSeriesEntry(entry)
-		for _, id := range ids {
+		_, _, official, unofficial := parseSeriesEntry(entry)
+		for _, id := range official {
 			listIDs[id] = true
 		}
+		for _, id := range unofficial {
+			unofficialIDs[id] = true
+		}
 	}
+	report.ListsOfficial += len(listIDs)
+	report.ListsUnofficial += len(unofficialIDs)
+	tooSmall := 0
 	want := map[string]silo.BoxSet{}
 	unreadable := map[string]bool{}
 	for _, id := range sortedKeys(listIDs) {
@@ -186,9 +198,15 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 		}
 		if b, ok := franchiseOf(r.list, byTVDB, cfg.SeriesMinShows); ok {
 			want[id] = b
+		} else {
+			tooSmall++
 		}
 	}
 	report.Franchises += len(want)
+	report.ListsTooSmall += tooSmall
+	s.log.Info("box set collections: series library checked", "library", lib.Name,
+		"series", len(series), "without_tvdb_id", len(series)-len(byTVDB), "official_lists", len(listIDs),
+		"unofficial_lists", len(unofficialIDs), "lists_too_small", tooSmall, "franchises", len(want))
 
 	confirmGone := func(id string) (bool, error) {
 		// Only TheTVDB's current answer for this list removes its
@@ -253,26 +271,30 @@ func artworkURL(image string) string {
 	return tvdbArtworkBase + "/" + strings.TrimLeft(image, "/")
 }
 
-// A series cache entry is "<checked unix>|<tvdb id>|<list ids, comma
-// separated>". The TheTVDB ID is kept so a rematched series is looked up
-// again.
-func formatSeriesEntry(checked time.Time, tvdbID string, listIDs []string) string {
-	sort.Strings(listIDs)
-	return strconv.FormatInt(checked.Unix(), 10) + "|" + tvdbID + "|" + strings.Join(listIDs, ",")
+// A series cache entry is "<checked unix>|<tvdb id>|<official list ids>|
+// <unofficial list ids>", the IDs comma separated. The TheTVDB ID is kept
+// so a rematched series is looked up again.
+func formatSeriesEntry(checked time.Time, tvdbID string, official, unofficial []string) string {
+	sort.Strings(official)
+	sort.Strings(unofficial)
+	return strconv.FormatInt(checked.Unix(), 10) + "|" + tvdbID + "|" + strings.Join(official, ",") + "|" + strings.Join(unofficial, ",")
 }
 
-func parseSeriesEntry(entry string) (checked time.Time, tvdbID string, listIDs []string) {
-	parts := strings.SplitN(entry, "|", 3)
-	if len(parts) != 3 {
-		return time.Time{}, "", nil
+func parseSeriesEntry(entry string) (checked time.Time, tvdbID string, official, unofficial []string) {
+	parts := strings.SplitN(entry, "|", 4)
+	if len(parts) != 4 {
+		return time.Time{}, "", nil, nil
 	}
 	if unix, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
 		checked = time.Unix(unix, 0)
 	}
 	if parts[2] != "" {
-		listIDs = strings.Split(parts[2], ",")
+		official = strings.Split(parts[2], ",")
 	}
-	return checked, parts[1], listIDs
+	if parts[3] != "" {
+		unofficial = strings.Split(parts[3], ",")
+	}
+	return checked, parts[1], official, unofficial
 }
 
 type storedList struct {

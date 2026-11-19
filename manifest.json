@@ -1,6 +1,6 @@
 {
   "plugin_id": "neilmc78.collections.boxsets",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "category": "Collections",
@@ -40,15 +40,14 @@
           {
             "key": "api_key",
             "label": "API key",
-            "description": "An unscoped Silo API key of the Owner or another administrator account; the plugin creates and updates collections with it. Stored encrypted.",
+            "description": "An unscoped Silo API key of the Owner or another administrator account; the plugin creates and updates collections with it. Required for the plugin to do anything. Stored encrypted; leave blank to keep the saved key.",
             "control": "ADMIN_FORM_CONTROL_PASSWORD",
-            "secret": true,
-            "required": true
+            "secret": true
           },
           {
             "key": "group_name",
             "label": "Group name",
-            "description": "The collection group box sets go in, created in each movie library that has box sets.",
+            "description": "The collection group box sets go in, in each movie library that has box sets. Changing it renames the group on the next sync.",
             "control": "ADMIN_FORM_CONTROL_TEXT",
             "default_value": "Box Sets",
             "placeholder": "Box Sets"
@@ -77,7 +76,7 @@
           {
             "key": "series_group_name",
             "label": "Franchise group name",
-            "description": "The collection group TV franchises go in, created in each series library with a franchise.",
+            "description": "The collection group TV franchises go in, in each series library with a franchise. Changing it renames the group on the next sync.",
             "control": "ADMIN_FORM_CONTROL_TEXT",
             "default_value": "Franchises",
             "placeholder": "Franchises"

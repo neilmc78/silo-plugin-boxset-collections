@@ -78,6 +78,7 @@ type API interface {
 	Collections(ctx context.Context, libraryID string) ([]silo.Collection, error)
 	Groups(ctx context.Context, libraryID string) ([]silo.Group, error)
 	CreateGroup(ctx context.Context, libraryID, name, slug string) (silo.Group, error)
+	RenameGroup(ctx context.Context, id, name string) error
 	CreateCollection(ctx context.Context, n silo.NewCollection) (silo.Collection, error)
 	UpdateCollection(ctx context.Context, id, title, description string) error
 	DeleteCollection(ctx context.Context, id string) error
@@ -179,7 +180,52 @@ func (s *Syncer) Run(ctx context.Context, _ *pluginv1.RunScheduledTaskRequest) (
 	if err != nil {
 		return nil, err
 	}
+	// Silo shows a plugin task's error but not its output, so a problem
+	// the previous sync met is reported as this run's error. The new sync
+	// has started all the same.
+	if problem := problemSummary(out["last_run"], s.config().TVDBAPIKey != ""); problem != "" {
+		return nil, errors.New(problem)
+	}
 	return &pluginv1.RunScheduledTaskResponse{Output: output}, nil
+}
+
+// problemSummary describes, in one line for Silo's task list, what went
+// wrong in a saved sync report, or "" when nothing did. tvdbKey says whether
+// series franchises are switched on.
+func problemSummary(last any, tvdbKey bool) string {
+	r, ok := last.(map[string]any)
+	if !ok {
+		return ""
+	}
+	num := func(key string) int {
+		v, _ := r[key].(float64)
+		return int(v)
+	}
+	first := ""
+	if e, _ := r["error"].(string); e != "" {
+		first = e
+	} else if errs, _ := r["errors"].([]any); len(errs) > 0 {
+		first, _ = errs[0].(string)
+	}
+	_, hasSeries := r["series_libraries"]
+	var cause string
+	switch {
+	case first != "":
+		cause = fmt.Sprintf("%d problem(s). First: %s", max(num("error_count"), 1), first)
+	case tvdbKey && hasSeries && num("series_libraries") == 0:
+		cause = "a TheTVDB key is set, but no series library was synced"
+	case tvdbKey && hasSeries && num("franchises") == 0 && num("official_lists") == 0:
+		cause = fmt.Sprintf("TheTVDB has no official list for any of your series (%d unofficial lists ignored)", num("unofficial_lists"))
+	default:
+		return ""
+	}
+	summary := fmt.Sprintf("last sync: %d box sets", num("box_sets"))
+	if tvdbKey && hasSeries {
+		summary += fmt.Sprintf("; %d series libraries, %d series looked up, %d without a TheTVDB ID, %d official lists (%d unofficial, %d too small), %d franchises",
+			num("series_libraries"), num("series_looked_up"), num("series_without_tvdb_id"),
+			num("official_lists"), num("unofficial_lists"), num("lists_too_small"), num("franchises"))
+	}
+	return summary + ". " + cause
 }
 
 // syncTimeout bounds one background sync.
@@ -286,6 +332,9 @@ type Report struct {
 	SeriesLooked      int
 	Franchises        int
 	SeriesWithoutTVDB int
+	ListsOfficial     int
+	ListsUnofficial   int
+	ListsTooSmall     int
 	Created           int
 	Updated           int
 	Removed           int
@@ -303,8 +352,9 @@ func (r Report) Map() map[string]any {
 	return map[string]any{
 		"libraries": r.Libraries, "movies_looked_up": r.Looked, "box_sets": r.BoxSets,
 		"series_libraries": r.SeriesLibraries, "series_looked_up": r.SeriesLooked, "franchises": r.Franchises,
-		"series_without_tvdb_id": r.SeriesWithoutTVDB,
-		"created":                r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
+		"series_without_tvdb_id": r.SeriesWithoutTVDB, "official_lists": r.ListsOfficial,
+		"unofficial_lists": r.ListsUnofficial, "lists_too_small": r.ListsTooSmall,
+		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
 	}
 }
 
@@ -577,9 +627,17 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 		return nil
 	}
 
-	groupID, err := ensureGroup(ctx, api, lib.ID, kind.groupName, kind.groupSlug)
+	group, err := ensureGroup(ctx, api, lib.ID, kind.groupName, kind.groupSlug)
 	if err != nil {
 		return err
+	}
+	groupID := group.ID
+	// The group name follows the plugin's setting, so changing the setting
+	// renames the group. A failed rename is reported; the sync carries on.
+	if name := strings.TrimSpace(kind.groupName); name != "" && strings.TrimSpace(group.Name) != name {
+		if err := api.RenameGroup(ctx, group.ID, name); err != nil {
+			report.addError(lib, "renaming the %q group to %q: %v", group.Name, name, err)
+		}
 	}
 	for _, id := range sortedKeys(want) {
 		if ctx.Err() != nil {
@@ -772,26 +830,28 @@ func isTMDBImage(address string) bool {
 	return strings.HasPrefix(address, "https://image.tmdb.org/") || strings.HasPrefix(address, "http://image.tmdb.org/")
 }
 
-func ensureGroup(ctx context.Context, api API, libraryID, name, slug string) (string, error) {
+// ensureGroup finds the plugin's group in a library by its slug, else one
+// already named name, else creates it.
+func ensureGroup(ctx context.Context, api API, libraryID, name, slug string) (silo.Group, error) {
 	groups, err := api.Groups(ctx, libraryID)
 	if err != nil {
-		return "", fmt.Errorf("listing collection groups: %w", err)
+		return silo.Group{}, fmt.Errorf("listing collection groups: %w", err)
 	}
 	for _, g := range groups {
 		if g.Slug == slug {
-			return g.ID, nil
+			return g, nil
 		}
 	}
 	for _, g := range groups {
 		if strings.EqualFold(strings.TrimSpace(g.Name), name) {
-			return g.ID, nil
+			return g, nil
 		}
 	}
 	g, err := api.CreateGroup(ctx, libraryID, name, slug)
 	if err != nil {
-		return "", fmt.Errorf("creating the %q group: %w", name, err)
+		return silo.Group{}, fmt.Errorf("creating the %q group: %w", name, err)
 	}
-	return g.ID, nil
+	return g, nil
 }
 
 func distinctBoxSets(byMovie map[string]string) []string {
@@ -828,8 +888,11 @@ const cacheSaveEvery = 200
 // Caches are named by a prefix: movieCache for box sets, seriesCache for
 // TheTVDB lists.
 const (
-	movieCache  = "cache"
-	seriesCache = "tvdb"
+	movieCache = "cache"
+	// seriesCache is versioned: v1.1.0 asked TheTVDB for the short series
+	// record, which may have left out every list, and cached that for a
+	// week. A new name makes every series be looked up again.
+	seriesCache = "tvdb2"
 )
 
 func cacheKey(prefix, libraryID string, n int) string {
