@@ -141,6 +141,9 @@ func (s *Syncer) Configure(_ context.Context, entries []*pluginv1.ConfigEntry) e
 	if err != nil {
 		return err
 	}
+	// Whether a TheTVDB key arrived, never the key itself.
+	s.log.Info("box set collections: configured", "tvdb_key", cfg.TVDBAPIKey != "",
+		"series_group", cfg.SeriesGroupName, "series_min_shows", cfg.SeriesMinShows)
 	s.mu.Lock()
 	s.cfg = cfg
 	s.mu.Unlock()
@@ -214,8 +217,21 @@ func problemSummary(last any, tvdbKey bool) string {
 		cause = fmt.Sprintf("%d problem(s). First: %s", max(num("error_count"), 1), first)
 	case tvdbKey && hasSeries && num("series_libraries") == 0:
 		cause = "a TheTVDB key is set, but no series library was synced"
-	case tvdbKey && hasSeries && num("franchises") == 0 && num("official_lists") == 0:
+	case tvdbKey && !hasSeries:
+		cause = "a TheTVDB key is set, but that sync did not check series libraries; it may have run before the key was saved, so run the task again"
+	case tvdbKey && num("franchises") == 0 && num("official_lists") == 0:
 		cause = fmt.Sprintf("TheTVDB has no official list for any of your series (%d unofficial lists ignored)", num("unofficial_lists"))
+	case tvdbKey && num("franchises") == 0:
+		cause = "no official list has enough of your series"
+		if misses, _ := r["near_misses"].([]any); len(misses) > 0 {
+			closest := make([]string, 0, len(misses))
+			for _, m := range misses {
+				if s, ok := m.(string); ok {
+					closest = append(closest, s)
+				}
+			}
+			cause += ". Closest: " + strings.Join(closest, "; ")
+		}
 	default:
 		return ""
 	}
@@ -335,10 +351,12 @@ type Report struct {
 	ListsOfficial     int
 	ListsUnofficial   int
 	ListsTooSmall     int
-	Created           int
-	Updated           int
-	Removed           int
-	Errors            []string
+	// NearMisses are the official lists closest to forming a franchise.
+	NearMisses []NearMiss
+	Created    int
+	Updated    int
+	Removed    int
+	Errors     []string
 }
 
 // Map is the report as a scheduled task's output.
@@ -353,9 +371,17 @@ func (r Report) Map() map[string]any {
 		"libraries": r.Libraries, "movies_looked_up": r.Looked, "box_sets": r.BoxSets,
 		"series_libraries": r.SeriesLibraries, "series_looked_up": r.SeriesLooked, "franchises": r.Franchises,
 		"series_without_tvdb_id": r.SeriesWithoutTVDB, "official_lists": r.ListsOfficial,
-		"unofficial_lists": r.ListsUnofficial, "lists_too_small": r.ListsTooSmall,
+		"unofficial_lists": r.ListsUnofficial, "lists_too_small": r.ListsTooSmall, "near_misses": nearMisses(r.NearMisses),
 		"created": r.Created, "updated": r.Updated, "removed": r.Removed, "errors": errs, "error_count": len(r.Errors),
 	}
+}
+
+func nearMisses(ns []NearMiss) []any {
+	out := make([]any, len(ns))
+	for i, n := range ns {
+		out[i] = n.String()
+	}
+	return out
 }
 
 // Sync brings every movie library's box set collections in line with its
