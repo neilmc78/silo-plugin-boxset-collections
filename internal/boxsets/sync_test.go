@@ -23,6 +23,8 @@ type fakeHost struct {
 	status   []string
 	settings map[string]any
 	maxKeys  int
+	// statusCh, when set, receives every status write.
+	statusCh chan string
 }
 
 func (h *fakeHost) SaveSettings(_ context.Context, values map[string]any) error {
@@ -34,8 +36,12 @@ func (h *fakeHost) SaveSettings(_ context.Context, values map[string]any) error 
 
 func (h *fakeHost) SetStatus(_ context.Context, report string) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.status = append(h.status, report)
+	ch := h.statusCh
+	h.mu.Unlock()
+	if ch != nil {
+		ch <- report
+	}
 	return nil
 }
 
@@ -68,6 +74,7 @@ func (h *fakeHost) WriteState(_ context.Context, k string, v []byte) error {
 type fakeAPI struct {
 	movieBoxSet map[string]string // movie -> box set ("" for none)
 	series      []silo.SeriesRef
+	onLookup    func(contentID string)
 	seriesErr   error
 	boxSets     map[string]silo.BoxSet
 	collections map[string]*silo.Collection
@@ -108,6 +115,9 @@ func (f *fakeAPI) Series(context.Context, string) ([]silo.SeriesRef, error) {
 	return slices.Clone(f.series), f.seriesErr
 }
 func (f *fakeAPI) ItemBoxSet(ctx context.Context, cid, lib string) (*silo.BoxSet, error) {
+	if f.onLookup != nil {
+		f.onLookup(cid)
+	}
 	f.lookups = append(f.lookups, cid)
 	if err := f.lookupErr[cid]; err != nil {
 		return nil, err

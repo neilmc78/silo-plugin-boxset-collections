@@ -97,6 +97,7 @@ type listResult struct {
 
 func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Config, lib Library, full bool,
 	stale map[string]bool, lists map[string]listResult, report *Report) error {
+	s.setProgress("TV franchises: listing series", lib.Name, 0)
 	series, err := api.Series(ctx, lib.ID)
 	if err != nil {
 		return fmt.Errorf("listing series: %w", err)
@@ -123,7 +124,9 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 	now := s.now()
 	next := make(map[string]string, len(byTVDB))
 	failed := 0
+	s.setProgress("TV franchises: looking up series on TheTVDB", lib.Name, len(byTVDB))
 	for _, tvdbID := range sortedKeys(byTVDB) {
+		s.stepProgress()
 		contentID := byTVDB[tvdbID]
 		entry, cached := cache[contentID]
 		checked, cachedID, _, _ := parseSeriesEntry(entry)
@@ -186,7 +189,9 @@ func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Co
 	tooSmall := 0
 	want := map[string]silo.BoxSet{}
 	unreadable := map[string]bool{}
+	s.setProgress("TV franchises: reading TheTVDB lists", lib.Name, len(listIDs))
 	for _, id := range sortedKeys(listIDs) {
+		s.stepProgress()
 		r, ok := lists[id]
 		if !ok {
 			l, err := s.cachedList(ctx, tv, id)

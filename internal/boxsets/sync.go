@@ -124,6 +124,10 @@ type Syncer struct {
 	state *syncState
 	// lastStatus is the Last sync text last written; guarded by mu.
 	lastStatus string
+	// prog is where the running sync is (progress.go); guarded by mu.
+	prog progress
+	// progressTicks paces the Last sync box's progress updates.
+	progressTicks func() (<-chan time.Time, func())
 
 	// running is set while a Run's background sync is going; wg lets tests
 	// wait for it.
@@ -144,7 +148,8 @@ func New(log *slog.Logger, host Host, newAPI func(baseURL, apiKey string) API) *
 	}
 	return &Syncer{
 		log: log, host: host, newAPI: newAPI, stale: map[string]bool{}, now: time.Now,
-		newTVDB: func(apiKey, pin string) TVDB { return tvdb.New("", apiKey, pin) },
+		progressTicks: defaultProgressTicks,
+		newTVDB:       func(apiKey, pin string) TVDB { return tvdb.New("", apiKey, pin) },
 	}
 }
 
@@ -275,9 +280,13 @@ const lastReportKey = "last_report"
 func (s *Syncer) syncAndRecord(ctx context.Context, full bool) {
 	start := time.Now()
 	cfg := s.config()
-	s.setStatus(fmt.Sprintf("Sync started %s (%s), plugin v%s, TV franchises: %s, TheTVDB key: %s.\nIf this stays for more than an hour, the sync stopped before finishing.",
-		start.UTC().Format(time.RFC3339), runKind(full), s.Version, onOff(cfg.TVFranchises), presence(cfg.TVDBAPIKey != "")))
+	header := fmt.Sprintf("Sync started %s (%s), plugin v%s, movie box sets: %s, TV franchises: %s, TheTVDB key: %s.\nA first sync of a large library can take an hour; later syncs only look up what changed.",
+		start.UTC().Format(time.RFC3339), runKind(full), s.Version, onOff(cfg.MovieBoxSets), onOff(cfg.TVFranchises), presence(cfg.TVDBAPIKey != ""))
+	s.setProgress("", "", 0)
+	s.setStatus(progressText(header, s.progressLine(), 0))
+	stopProgress := s.watchProgress(header, start)
 	report, err := s.Sync(ctx, full)
+	stopProgress()
 	s.setStatus(statusText(report, err, cfg, full, start, time.Now(), s.Version))
 	record := report.Map()
 	record["full"] = full
@@ -611,6 +620,7 @@ func (s *Syncer) Sync(ctx context.Context, full bool) (Report, error) {
 }
 
 func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Library, full bool, stale map[string]bool, report *Report) error {
+	s.setProgress("Movies: listing movies", lib.Name, 0)
 	movies, err := api.Movies(ctx, lib.ID)
 	if err != nil {
 		return fmt.Errorf("listing movies: %w", err)
@@ -633,7 +643,9 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	// means some box sets are unknown rather than gone, so nothing is
 	// removed (see below).
 	failed := 0
+	s.setProgress("Movies: looking up box sets", lib.Name, len(movies))
 	for _, id := range movies {
+		s.stepProgress()
 		if _, done := next[id]; done {
 			continue
 		}
@@ -686,7 +698,10 @@ func (s *Syncer) syncLibrary(ctx context.Context, api API, cfg Config, lib Libra
 	// movies of, or when box sets are off.
 	want := map[string]silo.BoxSet{}
 	unreadable := map[string]bool{}
-	for _, id := range distinctBoxSets(next) {
+	boxSetIDs := distinctBoxSets(next)
+	s.setProgress("Movies: reading box sets", lib.Name, len(boxSetIDs))
+	for _, id := range boxSetIDs {
+		s.stepProgress()
 		if b, ok := found[id]; ok {
 			want[id] = b
 			continue
@@ -849,7 +864,9 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 			report.addError(lib, "renaming the %q group to %q: %v", group.Name, name, err)
 		}
 	}
+	s.setProgress("Updating "+kind.noun+" collections", lib.Name, len(want))
 	for _, id := range sortedKeys(want) {
+		s.stepProgress()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
