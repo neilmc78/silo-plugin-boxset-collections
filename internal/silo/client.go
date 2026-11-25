@@ -379,6 +379,11 @@ type Collection struct {
 	BackdropURL     string  `json:"backdrop_url"`
 	BackdropHash    string  `json:"backdrop_thumbhash"`
 	ManagementMode  string  `json:"management_mode"`
+	// SourceConfig says where a collection's titles come from. A box set
+	// collection carries {"mode":"tmdb_collection","collection_id":N}, which
+	// Silo reads to leave it out of a movie page's collection row when the
+	// page already shows that box set.
+	SourceConfig json.RawMessage `json:"source_config"`
 }
 
 // Collections lists a library's collections.
@@ -427,6 +432,8 @@ type NewCollection struct {
 	Description string
 	Slug        string
 	GroupID     string
+	// SourceConfig, when set, is sent as the collection's source_config.
+	SourceConfig json.RawMessage
 }
 
 // CreateCollection creates a manual collection.
@@ -442,6 +449,9 @@ func (c *Client) CreateCollection(ctx context.Context, n NewCollection) (Collect
 	if n.GroupID != "" {
 		in["group_id"] = n.GroupID
 	}
+	if len(n.SourceConfig) > 0 {
+		in["source_config"] = n.SourceConfig
+	}
 	var out Collection
 	err := c.do(ctx, http.MethodPost, "/api/v2/admin/collections", nil, in, &out, nil)
 	return out, err
@@ -455,6 +465,12 @@ var ifMatchAny = map[string]string{"If-Match": "*"}
 // UpdateCollection patches a collection's title and description.
 func (c *Client) UpdateCollection(ctx context.Context, id, title, description string) error {
 	in := map[string]any{"title": title, "description": description}
+	return c.do(ctx, http.MethodPatch, "/api/v2/admin/collections/"+url.PathEscape(id), nil, in, nil, ifMatchAny)
+}
+
+// SetSourceConfig replaces a collection's source_config.
+func (c *Client) SetSourceConfig(ctx context.Context, id string, config json.RawMessage) error {
+	in := map[string]any{"source_config": config}
 	return c.do(ctx, http.MethodPatch, "/api/v2/admin/collections/"+url.PathEscape(id), nil, in, nil, ifMatchAny)
 }
 
