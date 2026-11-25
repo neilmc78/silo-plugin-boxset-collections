@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,7 @@ type API interface {
 	RenameGroup(ctx context.Context, id, name string) error
 	CreateCollection(ctx context.Context, n silo.NewCollection) (silo.Collection, error)
 	UpdateCollection(ctx context.Context, id, title, description string) error
+	SetSourceConfig(ctx context.Context, id string, config json.RawMessage) error
 	DeleteCollection(ctx context.Context, id string) error
 	Members(ctx context.Context, collectionID string) ([]string, error)
 	AddMember(ctx context.Context, collectionID, contentID string, position int) error
@@ -758,6 +760,9 @@ type collectionKind struct {
 	// as excluded, where the admin can see and undo it. Without it the
 	// deletion is remembered in the plugin's state.
 	excludeOnDelete func(id string)
+	// sourceConfig, when set, is the source_config a collection of this
+	// kind carries (see boxSetSourceConfig).
+	sourceConfig func(id string) json.RawMessage
 }
 
 func (s *Syncer) movieKind(cfg Config) collectionKind {
@@ -771,7 +776,36 @@ func (s *Syncer) movieKind(cfg Config) collectionKind {
 				s.state.excludingBoxSets[id] = true
 			}
 		},
+		sourceConfig: boxSetSourceConfig,
 	}
+}
+
+// boxSetSourceConfig marks a box set collection as a copy of its TMDB
+// collection. Silo leaves a collection marked this way out of a movie
+// page's collection row when the page already shows the same box set, so
+// the franchise isn't shown twice. Silo syncs only collections of type
+// tmdb or mdblist itself, so this marker on a manual collection hands
+// nothing over to it.
+func boxSetSourceConfig(id string) json.RawMessage {
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil || n <= 0 {
+		return nil
+	}
+	return json.RawMessage(fmt.Sprintf(`{"mode":"tmdb_collection","collection_id":%d}`, n))
+}
+
+// sameSource reports whether a collection's source_config already names
+// the same TMDB collection as want.
+func sameSource(have, want json.RawMessage) bool {
+	type source struct {
+		Mode         string `json:"mode"`
+		CollectionID int64  `json:"collection_id"`
+	}
+	var h, w source
+	if json.Unmarshal(want, &w) != nil {
+		return true
+	}
+	return json.Unmarshal(have, &h) == nil && h == w
 }
 
 // apply brings a library's collections of one kind in line with want,
@@ -873,9 +907,13 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 		b := want[id]
 		c, exists := have[id]
 		if !exists {
+			var source json.RawMessage
+			if kind.sourceConfig != nil {
+				source = kind.sourceConfig(id)
+			}
 			c, err = api.CreateCollection(ctx, silo.NewCollection{
 				LibraryID: lib.ID, Title: b.Title, Description: b.Overview,
-				Slug: kind.slugPrefix + id, GroupID: groupID,
+				Slug: kind.slugPrefix + id, GroupID: groupID, SourceConfig: source,
 			})
 			if err != nil {
 				report.addError(lib, "creating %q: %v", b.Title, err)
@@ -886,7 +924,19 @@ func (s *Syncer) apply(ctx context.Context, api API, lib Library, kind collectio
 		if s.state != nil {
 			s.state.set(ownedMap, s.state.owned, ownedKey(lib.ID, kind.slugPrefix+id), c.ID)
 		}
+		marked := false
+		if exists && kind.sourceConfig != nil {
+			// Collections made before the marker existed get it now.
+			if want := kind.sourceConfig(id); want != nil && !sameSource(c.SourceConfig, want) {
+				if err := api.SetSourceConfig(ctx, c.ID, want); err != nil {
+					report.addError(lib, "marking %q as a TMDB box set: %v", c.Title, err)
+				} else {
+					marked = true
+				}
+			}
+		}
 		changed, err := s.reconcile(ctx, api, c, b, exists)
+		changed = changed || marked
 		if err != nil {
 			report.addError(lib, "updating %q: %v", b.Title, err)
 			continue

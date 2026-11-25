@@ -2,6 +2,7 @@ package boxsets
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -304,5 +305,35 @@ func TestRunWhileASyncRunsSaysSo(t *testing.T) {
 	got := host.status[len(host.status)-1]
 	if !strings.HasPrefix(got, "Sync started earlier") || !strings.Contains(got, "this sync is still running") {
 		t.Fatalf("status = %q", got)
+	}
+}
+
+// Box set collections carry the TMDB collection marker Silo reads to leave
+// them out of a movie page's collection row when that page already shows
+// the box set. Franchises don't: no box set row stands in for them.
+func TestBoxSetCollectionsCarryTheTMDBMarker(t *testing.T) {
+	s, api, _ := setupSeries(t)
+	ctx := context.Background()
+	api.boxSets["1241"] = silo.BoxSet{ID: "1241", Title: "Harry Potter"}
+	api.movieBoxSet = map[string]string{"m1": "1241", "m2": "1241"}
+	if _, err := s.Sync(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(api.bySlug("box-set-1241").SourceConfig); got != `{"mode":"tmdb_collection","collection_id":1241}` {
+		t.Fatalf("box set source_config = %s", got)
+	}
+	if got := api.bySlug("tvdb-list-7").SourceConfig; len(got) != 0 {
+		t.Fatalf("franchise source_config = %s, want none", got)
+	}
+
+	// A collection made before the marker existed gets it once.
+	api.bySlug("box-set-1241").SourceConfig = json.RawMessage(`{}`)
+	for range 2 {
+		if _, err := s.Sync(ctx, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if api.sourceWrites != 1 || !sameSource(api.bySlug("box-set-1241").SourceConfig, boxSetSourceConfig("1241")) {
+		t.Fatalf("source writes = %d, config %s; want one write adding the marker", api.sourceWrites, api.bySlug("box-set-1241").SourceConfig)
 	}
 }

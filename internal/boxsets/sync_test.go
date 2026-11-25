@@ -2,6 +2,7 @@ package boxsets
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,23 +73,24 @@ func (h *fakeHost) WriteState(_ context.Context, k string, v []byte) error {
 // fakeAPI is an in-memory Silo: movies point at box sets, and box sets
 // with fewer than two movies answer 404 as Silo does.
 type fakeAPI struct {
-	movieBoxSet map[string]string // movie -> box set ("" for none)
-	series      []silo.SeriesRef
-	onLookup    func(contentID string)
-	seriesErr   error
-	boxSets     map[string]silo.BoxSet
-	collections map[string]*silo.Collection
-	members     map[string][]string
-	groups      []silo.Group
-	lookups     []string
-	boxSetReads int
-	deleteErr   error
-	lookupErr   map[string]error
-	readErr     map[string]error
-	slowMovies  time.Duration
-	sourceErr   error
-	uploads     []string
-	nextID      int
+	movieBoxSet  map[string]string // movie -> box set ("" for none)
+	series       []silo.SeriesRef
+	onLookup     func(contentID string)
+	sourceWrites int
+	seriesErr    error
+	boxSets      map[string]silo.BoxSet
+	collections  map[string]*silo.Collection
+	members      map[string][]string
+	groups       []silo.Group
+	lookups      []string
+	boxSetReads  int
+	deleteErr    error
+	lookupErr    map[string]error
+	readErr      map[string]error
+	slowMovies   time.Duration
+	sourceErr    error
+	uploads      []string
+	nextID       int
 }
 
 func newFakeAPI() *fakeAPI {
@@ -180,9 +182,14 @@ func (f *fakeAPI) RenameGroup(_ context.Context, id, name string) error {
 }
 func (f *fakeAPI) CreateCollection(_ context.Context, n silo.NewCollection) (silo.Collection, error) {
 	gid := n.GroupID
-	c := &silo.Collection{ID: f.id("c"), Title: n.Title, Description: n.Description, Slug: n.Slug, GroupID: &gid}
+	c := &silo.Collection{ID: f.id("c"), Title: n.Title, Description: n.Description, Slug: n.Slug, GroupID: &gid, SourceConfig: n.SourceConfig}
 	f.collections[c.ID] = c
 	return *c, nil
+}
+func (f *fakeAPI) SetSourceConfig(_ context.Context, id string, config json.RawMessage) error {
+	f.collections[id].SourceConfig = config
+	f.sourceWrites++
+	return nil
 }
 func (f *fakeAPI) UpdateCollection(_ context.Context, id, title, desc string) error {
 	f.collections[id].Title, f.collections[id].Description = title, desc
